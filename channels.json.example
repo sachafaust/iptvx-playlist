@@ -1,0 +1,14 @@
+{
+  "channels": [
+    {
+      "handle": "@Mooncut01",
+      "name": "Mooncut01",
+      "enabled": true
+    },
+    {
+      "handle": "@CinemaTyler",
+      "name": "CinemaTyler",
+      "enabled": true
+    }
+  ]
+}

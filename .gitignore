@@ -1,8 +1,10 @@
 # Generated playlists (contain credentials)
 *.m3u
+playlists/
 
 # Config with credentials
 config.json
+channels.json
 
 # Temp files
 /tmp/
