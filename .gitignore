@@ -1,0 +1,14 @@
+# Generated playlists (contain credentials)
+*.m3u
+
+# Temp files
+/tmp/
+*.log
+*.cache
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
