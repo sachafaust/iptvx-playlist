@@ -1,6 +1,9 @@
 # Generated playlists (contain credentials)
 *.m3u
 
+# Config with credentials
+config.json
+
 # Temp files
 /tmp/
 *.log
@@ -12,3 +15,6 @@
 # Python
 __pycache__/
 *.pyc
+*.pyo
+.venv/
+venv/

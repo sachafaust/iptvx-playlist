@@ -1,0 +1,9 @@
+{
+  "youtube_channel": "@Mooncut01",
+  "iptv_server": "http://your-iptv-server.com",
+  "iptv_username": "your_username",
+  "iptv_password": "your_password",
+  "output_file": "mooncut01-all.m3u",
+  "vod_cache_file": "/tmp/vod_cache.json",
+  "cache_max_age_hours": 24
+}
