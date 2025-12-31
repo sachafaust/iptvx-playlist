@@ -5,26 +5,28 @@ YouTube Movie Playlist Generator
 Generates M3U playlists from YouTube movie recommendation channels.
 Matches movies against IPTVX local data or Xtream Codes IPTV provider.
 
+Credentials are automatically pulled from IPTVX app configuration.
+
 Usage:
-    python generate_playlist.py @Mooncut01         # Full rebuild for channel
-    python generate_playlist.py --sync             # Incremental sync (new videos + catalog refresh)
-    python generate_playlist.py --add @NewChannel  # Add new channel to config
-    python generate_playlist.py --list             # List configured channels
+    python generate_playlist.py @Mooncut01           # Full rebuild for channel
+    python generate_playlist.py --sync               # Incremental sync
+    python generate_playlist.py --playlist xtreme    # Use specific IPTVX playlist
+    python generate_playlist.py --playlists          # List available IPTVX playlists
 """
 
 import argparse
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).parent
-CONFIG_FILE = SCRIPT_DIR / "config.json"
-CHANNELS_FILE = SCRIPT_DIR / "channels.json"
 IPTVX_REALM_PATH = Path.home() / "Library/Containers/27DB3F00-3088-4A00-BCCF-C8F6CB49A29F/Data/Documents/realm-db.realm"
+IPTVX_SQLITE_PATH = Path.home() / "Library/Containers/27DB3F00-3088-4A00-BCCF-C8F6CB49A29F/Data/Library/Application Support/IPTVX/CloudKit.sqlite"
 
 DEFAULT_CONFIG = {
     "iptv_server": "",
@@ -44,13 +46,95 @@ META_ENTRY_START = "# @entry_start"
 META_ENTRY_END = "# @entry_end"
 
 
-def load_config():
-    """Load IPTV config from file or environment."""
+def get_iptvx_playlists():
+    """Get playlists with Xtream credentials from IPTVX database."""
+    if not IPTVX_SQLITE_PATH.exists():
+        return []
+
+    try:
+        with sqlite3.connect(str(IPTVX_SQLITE_PATH)) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT ZNAME, ZURLSTRING, ZUSERNAME, ZPASSWORD
+                FROM ZPLAYLISTCONFIGURATION
+                WHERE ZUSERNAME IS NOT NULL AND ZUSERNAME <> ''
+            """)
+            rows = cursor.fetchall()
+
+        playlists = []
+        for name, url, username, password in rows:
+            if url and username and password:
+                # Normalize URL (remove trailing slash)
+                url = url.rstrip("/")
+                playlists.append({
+                    "name": name,
+                    "server": url,
+                    "username": username,
+                    "password": password,
+                })
+        return playlists
+    except sqlite3.Error as e:
+        print(f"Warning: Could not read IPTVX database: {e}")
+        return []
+    except Exception as e:
+        print(f"Warning: Unexpected error reading IPTVX database: {e}")
+        return []
+
+
+def select_playlist(playlists, playlist_name=None):
+    """Select a playlist from available options."""
+    if not playlists:
+        return None
+
+    # If name specified, find it
+    if playlist_name:
+        for p in playlists:
+            if p["name"].lower() == playlist_name.lower():
+                return p
+        print(f"Error: Playlist '{playlist_name}' not found.")
+        print("Available playlists:")
+        for p in playlists:
+            print(f"  - {p['name']}")
+        sys.exit(1)
+
+    # If only one, use it
+    if len(playlists) == 1:
+        print(f"Using IPTVX playlist: {playlists[0]['name']}")
+        return playlists[0]
+
+    # Multiple playlists - prompt user
+    print("Multiple IPTVX playlists with credentials found:")
+    for i, p in enumerate(playlists, 1):
+        print(f"  {i}. {p['name']} ({p['server']})")
+
+    while True:
+        try:
+            choice = input("Select playlist number (or 'q' to quit): ").strip()
+            if choice.lower() == 'q':
+                sys.exit(0)
+            idx = int(choice) - 1
+            if 0 <= idx < len(playlists):
+                return playlists[idx]
+            print("Invalid selection.")
+        except ValueError:
+            print("Enter a number.")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            sys.exit(0)
+
+
+def load_config(playlist_name=None):
+    """Load IPTV config from IPTVX database or environment."""
     config = DEFAULT_CONFIG.copy()
 
-    if CONFIG_FILE.exists():
-        with open(CONFIG_FILE) as f:
-            config.update(json.load(f))
+    # Try IPTVX database first
+    playlists = get_iptvx_playlists()
+    if playlists:
+        selected = select_playlist(playlists, playlist_name)
+        if selected:
+            config["iptv_server"] = selected["server"]
+            config["iptv_username"] = selected["username"]
+            config["iptv_password"] = selected["password"]
 
     # Override from environment
     for key in ["iptv_server", "iptv_username", "iptv_password"]:
@@ -59,33 +143,31 @@ def load_config():
             config[key] = os.environ[env_key]
 
     if not all([config["iptv_server"], config["iptv_username"], config["iptv_password"]]):
-        print("Error: IPTV credentials not configured.")
-        print("Create config.json or set IPTV_SERVER, IPTV_USERNAME, IPTV_PASSWORD")
+        print("Error: IPTV credentials not found.")
+        print("Options:")
+        print("  - Configure a playlist in IPTVX app")
+        print("  - Set IPTV_SERVER, IPTV_USERNAME, IPTV_PASSWORD environment variables")
         sys.exit(1)
 
     return config
 
 
-def load_channels():
-    """Load configured YouTube channels."""
-    if CHANNELS_FILE.exists():
-        with open(CHANNELS_FILE) as f:
-            return json.load(f)
-    return {"channels": []}
-
-
-def save_channels(data):
-    """Save channels configuration."""
-    with open(CHANNELS_FILE, "w") as f:
-        json.dump(data, f, indent=2)
-
-
 def run_command(cmd, timeout=300):
-    """Run shell command and return output."""
+    """Run command and return output.
+
+    Args:
+        cmd: List of command arguments (not a shell string)
+        timeout: Command timeout in seconds
+
+    Returns:
+        Tuple of (stdout, returncode)
+    """
     try:
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         return result.stdout, result.returncode
     except subprocess.TimeoutExpired:
+        return "", 1
+    except FileNotFoundError:
         return "", 1
 
 
@@ -163,7 +245,10 @@ def check_stream_url(url, timeout=10, retries=3):
 def fetch_channel_videos(channel_handle):
     """Fetch list of videos from YouTube channel."""
     print(f"  Fetching video list from YouTube...")
-    cmd = f'yt-dlp --flat-playlist --print "%(id)s|%(title)s" "https://www.youtube.com/{channel_handle}/videos"'
+    cmd = [
+        'yt-dlp', '--flat-playlist', '--print', '%(id)s|%(title)s',
+        f'https://www.youtube.com/{channel_handle}/videos'
+    ]
     output, code = run_command(cmd, timeout=60)
 
     if code != 0:
@@ -180,7 +265,10 @@ def fetch_channel_videos(channel_handle):
 
 def fetch_video_description(video_id):
     """Fetch description for a single video."""
-    cmd = f'yt-dlp --skip-download --print description "https://www.youtube.com/watch?v={video_id}"'
+    cmd = [
+        'yt-dlp', '--skip-download', '--print', 'description',
+        f'https://www.youtube.com/watch?v={video_id}'
+    ]
     output, code = run_command(cmd, timeout=30)
     return output if code == 0 else ""
 
@@ -228,11 +316,12 @@ def fetch_vod_catalog(config):
         tmp_path = tmp.name
 
     try:
-        cmd = f'curl -s --max-time 180 -o "{tmp_path}" "{url}"'
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=200)
+        cmd = ['curl', '-s', '--max-time', '180', '-o', tmp_path, url]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=200)
 
         if result.returncode != 0:
-            print("Error fetching VOD catalog")
+            print("Error: Failed to fetch VOD catalog from provider.")
+            print(f"  Check your network connection and verify the server is accessible.")
             return []
 
         with open(tmp_path, 'r') as f:
@@ -241,7 +330,14 @@ def fetch_vod_catalog(config):
         print(f"Loaded {len(data)} VOD items from provider")
         return data
     except json.JSONDecodeError:
-        print("Error parsing VOD catalog")
+        print("Error: VOD catalog response is not valid JSON.")
+        print("  The server may be down or credentials may be incorrect.")
+        return []
+    except subprocess.TimeoutExpired:
+        print("Error: VOD catalog fetch timed out after 3 minutes.")
+        return []
+    except FileNotFoundError:
+        print("Error: 'curl' command not found. Please install curl.")
         return []
     except Exception as e:
         print(f"Error fetching VOD catalog: {e}")
@@ -607,48 +703,6 @@ def process_channel(channel_handle, config, vod_index, existing_metadata=None, n
     return video_data
 
 
-def add_channel(channel_handle):
-    """Add a new channel to configuration."""
-    if not channel_handle.startswith("@"):
-        channel_handle = f"@{channel_handle}"
-
-    channels_data = load_channels()
-
-    for ch in channels_data["channels"]:
-        if ch["handle"].lower() == channel_handle.lower():
-            print(f"Channel {channel_handle} already configured")
-            return
-
-    print(f"Verifying {channel_handle}...")
-    videos = fetch_channel_videos(channel_handle)
-    if not videos:
-        print(f"Error: Could not find channel {channel_handle}")
-        return
-
-    channels_data["channels"].append({
-        "handle": channel_handle,
-        "name": channel_handle.lstrip("@"),
-        "enabled": True,
-    })
-    save_channels(channels_data)
-    print(f"Added {channel_handle} ({len(videos)} videos found)")
-
-
-def list_channels():
-    """List all configured channels."""
-    channels_data = load_channels()
-
-    if not channels_data["channels"]:
-        print("No channels configured. Add one with:")
-        print("  python generate_playlist.py --add @ChannelName")
-        return
-
-    print("Configured channels:")
-    for ch in channels_data["channels"]:
-        status = "✓" if ch.get("enabled", True) else "✗"
-        print(f"  {status} {ch['handle']}")
-
-
 def sync_playlists(config, workers=5):
     """Sync all existing playlists with current catalog."""
     output_dir = SCRIPT_DIR / config["output_dir"]
@@ -700,54 +754,87 @@ def sync_playlists(config, workers=5):
         print(f"    Unmatched: {stats['unmatched']}")
 
 
+def list_iptvx_playlists():
+    """List available IPTVX playlists with Xtream credentials."""
+    playlists = get_iptvx_playlists()
+    if not playlists:
+        print("No IPTVX playlists with Xtream credentials found.")
+        print("Configure a playlist in IPTVX app with username/password.")
+        return None
+
+    print("Available IPTVX playlists:")
+    for i, p in enumerate(playlists, 1):
+        print(f"  {i}. {p['name']} ({p['server']})")
+
+    # Allow selection
+    if len(playlists) == 1:
+        return playlists[0]
+
+    while True:
+        try:
+            choice = input("\nSelect playlist number (or 'q' to quit): ").strip()
+            if choice.lower() == 'q':
+                return None
+            idx = int(choice) - 1
+            if 0 <= idx < len(playlists):
+                return playlists[idx]
+            print("Invalid selection.")
+        except ValueError:
+            print("Enter a number.")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Generate M3U playlists from YouTube movie recommendation channels",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python generate_playlist.py @Mooncut01         # Full rebuild for channel
-  python generate_playlist.py --sync             # Sync all playlists
-  python generate_playlist.py --add @CinemaTyler # Add new channel
-  python generate_playlist.py --list             # List channels
+  python generate_playlist.py @Mooncut01           # Full rebuild for channel
+  python generate_playlist.py --sync               # Sync all playlists
+  python generate_playlist.py --playlist xtreme    # Use specific IPTVX playlist
+  python generate_playlist.py --playlists          # List IPTVX playlists
         """
     )
-    parser.add_argument("channels", nargs="*", help="YouTube channel handles to process (full rebuild)")
-    parser.add_argument("--add", metavar="CHANNEL", help="Add a new channel")
-    parser.add_argument("--list", action="store_true", help="List configured channels")
+    parser.add_argument("--version", "-V", action="version", version="%(prog)s 0.1.0")
+    parser.add_argument("channels", nargs="*", help="YouTube channel handles (e.g., @Mooncut01)")
+    parser.add_argument("--playlist", "-p", metavar="NAME", help="IPTVX playlist to use for credentials")
+    parser.add_argument("--playlists", action="store_true", help="List available IPTVX playlists")
     parser.add_argument("--sync", action="store_true", help="Sync existing playlists with current catalog")
     parser.add_argument("--workers", type=int, default=5, help="Parallel workers for URL validation (default: 5)")
     parser.add_argument("-o", "--output", help="Output file (for single channel)")
     args = parser.parse_args()
 
-    # Handle --add
-    if args.add:
-        add_channel(args.add)
-        return
-
-    # Handle --list
-    if args.list:
-        list_channels()
+    # Handle --playlists
+    if args.playlists:
+        selected = list_iptvx_playlists()
+        if selected:
+            print(f"\nSelected: {selected['name']}")
+            print(f"  Server: {selected['server']}")
+            print(f"  Username: {selected['username']}")
         return
 
     # Load config
-    config = load_config()
+    config = load_config(args.playlist)
 
     # Handle --sync
     if args.sync:
         sync_playlists(config, workers=args.workers)
         return
 
-    # Full rebuild mode
-    if args.channels:
-        channels = [{"handle": ch if ch.startswith("@") else f"@{ch}", "name": ch.lstrip("@")} for ch in args.channels]
-    else:
-        channels_data = load_channels()
-        channels = [ch for ch in channels_data["channels"] if ch.get("enabled", True)]
-
-    if not channels:
-        print("No channels to process. Specify channels or add with --add")
+    # Full rebuild mode - require channel argument
+    if not args.channels:
+        print("No channel specified.\n")
+        print("Usage: python generate_playlist.py @ChannelName")
+        print("\nExamples:")
+        print("  python generate_playlist.py @Mooncut01")
+        print("  python generate_playlist.py @CinemaTyler")
+        print("  python generate_playlist.py --sync  # sync existing playlists")
         sys.exit(1)
+
+    channels = [{"handle": ch if ch.startswith("@") else f"@{ch}", "name": ch.lstrip("@")} for ch in args.channels]
 
     # Fetch VOD catalog
     vod_data = fetch_vod_catalog(config)
