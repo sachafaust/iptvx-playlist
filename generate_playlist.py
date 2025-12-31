@@ -826,12 +826,7 @@ Examples:
 
     # Full rebuild mode - require channel argument
     if not args.channels:
-        print("No channel specified.\n")
-        print("Usage: python generate_playlist.py @ChannelName")
-        print("\nExamples:")
-        print("  python generate_playlist.py @Mooncut01")
-        print("  python generate_playlist.py @CinemaTyler")
-        print("  python generate_playlist.py --sync  # sync existing playlists")
+        parser.print_help()
         sys.exit(1)
 
     channels = [{"handle": ch if ch.startswith("@") else f"@{ch}", "name": ch.lstrip("@")} for ch in args.channels]

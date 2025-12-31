@@ -473,7 +473,7 @@ class TestMain:
                     gp.main()
                 assert exc_info.value.code == 1
                 captured = capsys.readouterr()
-                assert 'No channel specified' in captured.out
+                assert 'usage:' in captured.out  # Shows full help
 
     def test_playlists_flag(self, capsys):
         with patch('sys.argv', ['generate_playlist.py', '--playlists']):

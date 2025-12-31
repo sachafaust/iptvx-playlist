@@ -7,7 +7,6 @@ Generate M3U playlists from YouTube movie recommendation channels, matched again
 ```
 iptvx-playlist/
 ├── generate_playlist.py   # Main CLI tool
-├── hide_broken.js         # IPTVX Realm helper (Node.js)
 ├── tests/                 # pytest unit tests (86% coverage)
 ├── playlists/             # Generated M3U output (gitignored)
 ├── pyproject.toml         # Project config, pytest settings
