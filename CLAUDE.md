@@ -19,8 +19,14 @@ iptvx-playlist/
 # Generate playlist for a YouTube channel
 python generate_playlist.py @ChannelName
 
+# Generate and upload to Google Drive + add to IPTVX
+python generate_playlist.py @ChannelName --upload
+
 # Sync existing playlists (validates URLs, finds new videos)
 python generate_playlist.py --sync
+
+# Sync and upload all changed playlists
+python generate_playlist.py --sync --upload
 
 # List available IPTVX playlists
 python generate_playlist.py --playlists
@@ -30,6 +36,9 @@ python generate_playlist.py @Channel --playlist "playlist-name"
 
 # Parallel workers for URL validation (default: 5)
 python generate_playlist.py --sync --workers 10
+
+# Set up Google Drive authentication (one-time)
+python generate_playlist.py --setup-gdrive
 ```
 
 ## Credential Sources (priority order)
@@ -50,6 +59,9 @@ No config file needed. Credentials are never stored in project files.
 | `find_movie()` | Match movie title against VOD index |
 | `generate_m3u_content()` | Build M3U with metadata tracking |
 | `sync_playlists()` | Incremental update with URL validation |
+| `upload_to_gdrive()` | Upload M3U file to Google Drive |
+| `share_file_public()` | Share file with "anyone with link" |
+| `add_playlist_to_iptvx()` | Add/update M3U playlist in IPTVX database |
 
 ## M3U Metadata Format
 
@@ -91,6 +103,29 @@ python3 -m http.server 8080
 # Add to IPTVX as M3U playlist:
 # http://localhost:8080/playlists/channelname.m3u
 ```
+
+### Google Drive Upload (Recommended)
+
+Automatically upload playlists to Google Drive and register them in IPTVX:
+
+**One-time setup:**
+1. Install rclone: `brew install rclone`
+2. Configure Google Drive remote:
+   ```bash
+   rclone config create gdrive drive scope drive root_folder_id 10i-MdLuzIZCWzRtW5AjBlWJSi7f8JXl3
+   ```
+3. Follow the OAuth flow in browser when prompted
+
+**Usage:**
+```bash
+# Upload + share + add to IPTVX in one command
+python3 generate_playlist.py @ChannelName --upload
+
+# Sync all and upload
+python3 generate_playlist.py --sync --upload
+```
+
+Files are uploaded to the configured Google Drive folder and shared with "anyone with link" permission. The URL is automatically added to IPTVX.
 
 ## hide_broken.js
 
@@ -136,3 +171,11 @@ pytest tests/test_generate_playlist.py::TestFindMovie -v
 - **yt-dlp** - YouTube scraping (`brew install yt-dlp`)
 - **curl** - API requests (pre-installed on macOS)
 - **Node.js + realm** - Only for hide_broken.js
+
+### Optional: Google Drive Upload
+
+```bash
+brew install rclone
+```
+
+Configure with: `rclone config create gdrive drive scope drive root_folder_id <FOLDER_ID>`
