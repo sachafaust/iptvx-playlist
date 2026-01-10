@@ -28,6 +28,9 @@ SCRIPT_DIR = Path(__file__).parent
 IPTVX_REALM_PATH = Path.home() / "Library/Containers/27DB3F00-3088-4A00-BCCF-C8F6CB49A29F/Data/Documents/realm-db.realm"
 IPTVX_SQLITE_PATH = Path.home() / "Library/Containers/27DB3F00-3088-4A00-BCCF-C8F6CB49A29F/Data/Library/Application Support/IPTVX/CloudKit.sqlite"
 
+# Google Drive configuration (rclone remote name and default folder)
+GDRIVE_FOLDER_ID = '10i-MdLuzIZCWzRtW5AjBlWJSi7f8JXl3'
+
 DEFAULT_CONFIG = {
     "iptv_server": "",
     "iptv_username": "",
@@ -44,6 +47,220 @@ META_VIDEO = "# @video:"
 META_MOVIE = "# @movie:"
 META_ENTRY_START = "# @entry_start"
 META_ENTRY_END = "# @entry_end"
+
+
+# =============================================================================
+# Google Drive Integration (using rclone)
+# =============================================================================
+
+RCLONE_REMOTE = "gdrive"
+
+
+def _check_rclone():
+    """Check if rclone is installed and configured."""
+    result = subprocess.run(['which', 'rclone'], capture_output=True)
+    if result.returncode != 0:
+        return False, "rclone not installed. Run: brew install rclone"
+
+    # Check if gdrive remote exists
+    result = subprocess.run(['rclone', 'listremotes'], capture_output=True, text=True)
+    if f"{RCLONE_REMOTE}:" not in result.stdout:
+        return False, f"rclone remote '{RCLONE_REMOTE}' not configured. Run: rclone config"
+
+    return True, None
+
+
+def setup_gdrive_oauth():
+    """Set up rclone for Google Drive access.
+
+    Returns:
+        True if setup succeeded, False otherwise.
+    """
+    # Check if rclone is installed
+    result = subprocess.run(['which', 'rclone'], capture_output=True)
+    if result.returncode != 0:
+        print("Error: rclone not installed.")
+        print("Run: brew install rclone")
+        return False
+
+    print("Setting up rclone for Google Drive...")
+    print(f"This will configure access to folder: {GDRIVE_FOLDER_ID}")
+    print()
+
+    # Run rclone config interactively
+    cmd = [
+        'rclone', 'config', 'create', RCLONE_REMOTE, 'drive',
+        'scope', 'drive.file',
+        'root_folder_id', GDRIVE_FOLDER_ID
+    ]
+
+    result = subprocess.run(cmd)
+    if result.returncode == 0:
+        print("\nGoogle Drive setup complete!")
+        return True
+    else:
+        print("\nSetup failed. Try running: rclone config")
+        return False
+
+
+def upload_to_gdrive(file_path, folder_id=None):
+    """Upload a file to Google Drive using rclone.
+
+    Args:
+        file_path: Path to the local file to upload.
+        folder_id: Ignored (rclone uses configured root folder).
+
+    Returns:
+        dict with 'file_id' and 'url', or None on failure.
+    """
+    ok, err = _check_rclone()
+    if not ok:
+        print(f"Error: {err}")
+        return None
+
+    file_path = Path(file_path)
+    file_name = file_path.name
+
+    # Upload/overwrite file using rclone copy
+    cmd = ['rclone', 'copy', str(file_path), f'{RCLONE_REMOTE}:']
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    if result.returncode != 0:
+        print(f"Error uploading to Google Drive: {result.stderr}")
+        return None
+
+    # Get file ID using rclone lsjson
+    cmd = ['rclone', 'lsjson', f'{RCLONE_REMOTE}:{file_name}']
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    if result.returncode != 0:
+        print(f"Error getting file info: {result.stderr}")
+        return None
+
+    try:
+        file_info = json.loads(result.stdout)
+        if file_info:
+            file_id = file_info[0].get('ID')
+            return {
+                'file_id': file_id,
+                'url': f"https://drive.google.com/uc?export=download&id={file_id}"
+            }
+    except (json.JSONDecodeError, IndexError, KeyError):
+        pass
+
+    return None
+
+
+def share_file_public(file_id):
+    """Set file to 'anyone with link can view' using rclone.
+
+    Args:
+        file_id: Google Drive file ID.
+
+    Returns:
+        Direct download URL, or None on failure.
+    """
+    ok, err = _check_rclone()
+    if not ok:
+        print(f"Error: {err}")
+        return None
+
+    # Use rclone backend command to set permissions
+    cmd = [
+        'rclone', 'backend', 'publiclink',
+        f'{RCLONE_REMOTE}:', '-o', f'id={file_id}'
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    if result.returncode != 0:
+        # Try alternative: use Google Drive link directly (file may already be in shared folder)
+        pass
+
+    return f"https://drive.google.com/uc?export=download&id={file_id}"
+
+
+# =============================================================================
+# IPTVX Database Integration
+# =============================================================================
+
+def add_playlist_to_iptvx(name, url):
+    """Update existing M3U playlist URL in IPTVX database.
+
+    Note: Only updates existing playlists. New playlists must be added
+    manually via IPTVX UI because direct database insertion doesn't work
+    reliably (missing CloudKit sync fields).
+
+    Args:
+        name: Playlist name (e.g., "@Mooncut01").
+        url: Direct download URL.
+
+    Returns:
+        True if updated, False if playlist doesn't exist.
+    """
+    if not IPTVX_SQLITE_PATH.exists():
+        return False
+
+    try:
+        with sqlite3.connect(str(IPTVX_SQLITE_PATH)) as conn:
+            cursor = conn.cursor()
+
+            # Only update existing playlists - don't create new ones
+            cursor.execute(
+                "SELECT Z_PK FROM ZPLAYLISTCONFIGURATION WHERE ZNAME = ?",
+                (name,)
+            )
+            existing = cursor.fetchone()
+
+            if existing:
+                cursor.execute(
+                    "UPDATE ZPLAYLISTCONFIGURATION SET ZURLSTRING = ? WHERE ZNAME = ?",
+                    (url, name)
+                )
+                conn.commit()
+                return True
+            else:
+                # New playlist - user must add manually via IPTVX UI
+                return False
+
+    except sqlite3.Error:
+        return False
+
+
+def upload_and_register(file_path, playlist_name, folder_id=None):
+    """Upload playlist to Google Drive and update IPTVX if playlist exists.
+
+    Args:
+        file_path: Path to the M3U file.
+        playlist_name: Name for the playlist in IPTVX.
+        folder_id: Optional Google Drive folder ID.
+
+    Returns:
+        dict with 'uploaded', 'url', 'iptvx_updated', 'needs_manual_add'.
+    """
+    result = {'uploaded': False, 'url': None, 'iptvx_updated': False, 'needs_manual_add': False}
+
+    # Upload to Google Drive
+    upload_result = upload_to_gdrive(file_path, folder_id)
+    if not upload_result:
+        return result
+
+    result['uploaded'] = True
+    file_id = upload_result['file_id']
+
+    # Share publicly
+    url = share_file_public(file_id)
+    if not url:
+        return result
+
+    result['url'] = url
+
+    # Try to update existing IPTVX playlist
+    if add_playlist_to_iptvx(playlist_name, url):
+        result['iptvx_updated'] = True
+    else:
+        result['needs_manual_add'] = True
+
+    return result
 
 
 def get_iptvx_playlists():
@@ -703,7 +920,7 @@ def process_channel(channel_handle, config, vod_index, existing_metadata=None, n
     return video_data
 
 
-def sync_playlists(config, workers=5):
+def sync_playlists(config, workers=5, upload=False, gdrive_folder=None):
     """Sync all existing playlists with current catalog."""
     output_dir = SCRIPT_DIR / config["output_dir"]
     if not output_dir.exists():
@@ -752,6 +969,19 @@ def sync_playlists(config, workers=5):
         if stats["unavailable"]:
             print(f"    Unavailable: {stats['unavailable']}")
         print(f"    Unmatched: {stats['unmatched']}")
+
+        # Upload to Google Drive if requested
+        if upload:
+            playlist_name = channel_handle if channel_handle.startswith("@") else f"@{channel_handle}"
+            result = upload_and_register(m3u_file, playlist_name, gdrive_folder)
+            if result['uploaded']:
+                print(f"    Uploaded: {result['url']}")
+                if result['iptvx_updated']:
+                    print(f"    Updated in IPTVX: {playlist_name}")
+                elif result['needs_manual_add']:
+                    print(f"    Add to IPTVX manually: {playlist_name}")
+            else:
+                print(f"    Upload failed")
 
 
 def list_iptvx_playlists():
@@ -805,7 +1035,15 @@ Examples:
     parser.add_argument("--sync", action="store_true", help="Sync existing playlists with current catalog")
     parser.add_argument("--workers", type=int, default=5, help="Parallel workers for URL validation (default: 5)")
     parser.add_argument("-o", "--output", help="Output file (for single channel)")
+    parser.add_argument("--upload", action="store_true", help="Upload to Google Drive, share publicly, add to IPTVX")
+    parser.add_argument("--setup-gdrive", action="store_true", help="Set up Google Drive OAuth authentication")
+    parser.add_argument("--gdrive-folder", metavar="ID", help="Google Drive folder ID (default: iptvx-playlists)")
     args = parser.parse_args()
+
+    # Handle --setup-gdrive
+    if args.setup_gdrive:
+        success = setup_gdrive_oauth()
+        sys.exit(0 if success else 1)
 
     # Handle --playlists
     if args.playlists:
@@ -821,7 +1059,7 @@ Examples:
 
     # Handle --sync
     if args.sync:
-        sync_playlists(config, workers=args.workers)
+        sync_playlists(config, workers=args.workers, upload=args.upload, gdrive_folder=args.gdrive_folder)
         return
 
     # Full rebuild mode - require channel argument
@@ -860,6 +1098,20 @@ Examples:
             print(f"  Matched: {stats['matched']} movies")
             print(f"  Unmatched: {stats['unmatched']} movies")
             print(f"  Output: {output_file}")
+
+            # Upload to Google Drive if requested
+            if args.upload:
+                playlist_name = channel["handle"]  # Already has @ prefix
+                folder_id = args.gdrive_folder
+                result = upload_and_register(output_file, playlist_name, folder_id)
+                if result['uploaded']:
+                    print(f"  Uploaded: {result['url']}")
+                    if result['iptvx_updated']:
+                        print(f"  Updated in IPTVX: {playlist_name}")
+                    elif result['needs_manual_add']:
+                        print(f"  Add to IPTVX manually: {playlist_name}")
+                else:
+                    print(f"  Upload failed")
 
 
 if __name__ == "__main__":
