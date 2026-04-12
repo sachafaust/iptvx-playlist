@@ -133,7 +133,7 @@ class TestSelectPlaylist:
 
 
 class TestLoadConfig:
-    """Tests for load_config()"""
+    """Tests for load_config() — thin wrapper around load_configs()"""
 
     def test_loads_from_iptvx_database(self):
         mock_playlists = [{'name': 'test', 'server': 'http://s.com', 'username': 'u', 'password': 'p'}]
@@ -146,17 +146,60 @@ class TestLoadConfig:
             assert config['iptv_password'] == 'p'
 
     def test_environment_overrides_database(self):
-        mock_playlists = [{'name': 'test', 'server': 'http://s.com', 'username': 'u', 'password': 'p'}]
-
-        with patch.object(gp, 'get_iptvx_playlists', return_value=mock_playlists):
-            with patch.dict('os.environ', {'IPTV_SERVER': 'http://env.com'}):
-                config = gp.load_config('test')
-                assert config['iptv_server'] == 'http://env.com'
+        with patch.dict('os.environ', {
+            'IPTV_SERVER': 'http://env.com',
+            'IPTV_USERNAME': 'env_u',
+            'IPTV_PASSWORD': 'env_p',
+        }):
+            config = gp.load_config(None)
+            assert config['iptv_server'] == 'http://env.com'
+            assert config['iptv_username'] == 'env_u'
 
     def test_exits_when_no_credentials(self):
         with patch.object(gp, 'get_iptvx_playlists', return_value=[]):
             with pytest.raises(SystemExit):
                 gp.load_config(None)
+
+
+class TestLoadConfigs:
+    """Tests for load_configs()"""
+
+    def test_returns_all_playlists_when_no_name(self):
+        mock_playlists = [
+            {'name': 'xtreme', 'server': 'http://a.com', 'username': 'u1', 'password': 'p1'},
+            {'name': 'new', 'server': 'http://b.com', 'username': 'u2', 'password': 'p2'},
+        ]
+        with patch.object(gp, 'get_iptvx_playlists', return_value=mock_playlists):
+            configs = gp.load_configs(None)
+            assert len(configs) == 2
+            assert configs[0]['iptv_server'] == 'http://a.com'
+            assert configs[0]['_name'] == 'xtreme'
+            assert configs[1]['iptv_server'] == 'http://b.com'
+
+    def test_returns_single_when_name_specified(self):
+        mock_playlists = [
+            {'name': 'xtreme', 'server': 'http://a.com', 'username': 'u1', 'password': 'p1'},
+            {'name': 'new', 'server': 'http://b.com', 'username': 'u2', 'password': 'p2'},
+        ]
+        with patch.object(gp, 'get_iptvx_playlists', return_value=mock_playlists):
+            configs = gp.load_configs('xtreme')
+            assert len(configs) == 1
+            assert configs[0]['iptv_server'] == 'http://a.com'
+
+    def test_env_vars_override_everything(self):
+        with patch.dict('os.environ', {
+            'IPTV_SERVER': 'http://env.com',
+            'IPTV_USERNAME': 'env_u',
+            'IPTV_PASSWORD': 'env_p',
+        }):
+            configs = gp.load_configs(None)
+            assert len(configs) == 1
+            assert configs[0]['iptv_server'] == 'http://env.com'
+
+    def test_exits_when_no_credentials(self):
+        with patch.object(gp, 'get_iptvx_playlists', return_value=[]):
+            with pytest.raises(SystemExit):
+                gp.load_configs(None)
 
 
 class TestRunCommand:
@@ -288,6 +331,64 @@ class TestBuildVodIndex:
         index = gp.build_vod_index(vod_data)
         assert len(index) == 1
 
+    def test_first_wins_dedup(self):
+        """First item with same lowercase name wins (priority order)."""
+        vod_data = [
+            {'name': 'The Matrix', 'stream_id': 1, '_source': {'server': 'http://a.com'}},
+            {'name': 'The Matrix', 'stream_id': 2, '_source': {'server': 'http://b.com'}},
+        ]
+        index = gp.build_vod_index(vod_data)
+        assert index['the matrix']['stream_id'] == 1
+
+
+class TestBuildStreamUrl:
+    """Tests for build_stream_url()"""
+
+    def test_uses_embedded_source(self):
+        result = {
+            'stream_id': 123,
+            'container_extension': 'mkv',
+            '_source': {'server': 'http://a.com', 'username': 'u1', 'password': 'p1'},
+        }
+        url = gp.build_stream_url(result)
+        assert url == 'http://a.com/movie/u1/p1/123.mkv'
+
+    def test_falls_back_to_config(self):
+        result = {'stream_id': 456, 'container_extension': 'mp4'}
+        config = {'iptv_server': 'http://b.com', 'iptv_username': 'u2', 'iptv_password': 'p2'}
+        url = gp.build_stream_url(result, config)
+        assert url == 'http://b.com/movie/u2/p2/456.mp4'
+
+    def test_defaults_to_mp4_extension(self):
+        result = {'stream_id': 789, '_source': {'server': 'http://c.com', 'username': 'u', 'password': 'p'}}
+        url = gp.build_stream_url(result)
+        assert url.endswith('/789.mp4')
+
+
+class TestFetchMultiVodCatalog:
+    """Tests for fetch_multi_vod_catalog()"""
+
+    def test_merges_catalogs_with_source(self):
+        configs = [
+            {'iptv_server': 'http://a.com', 'iptv_username': 'u1', 'iptv_password': 'p1', '_name': 'first'},
+            {'iptv_server': 'http://b.com', 'iptv_username': 'u2', 'iptv_password': 'p2', '_name': 'second'},
+        ]
+        with patch.object(gp, 'fetch_vod_catalog', side_effect=[
+            [{'name': 'Movie A', 'stream_id': 1}],
+            [{'name': 'Movie B', 'stream_id': 2}],
+        ]):
+            merged = gp.fetch_multi_vod_catalog(configs)
+            assert len(merged) == 2
+            assert merged[0]['_source']['name'] == 'first'
+            assert merged[0]['_source']['server'] == 'http://a.com'
+            assert merged[1]['_source']['name'] == 'second'
+
+    def test_returns_empty_when_all_fail(self):
+        configs = [{'iptv_server': 'http://a.com', 'iptv_username': 'u', 'iptv_password': 'p', '_name': 'x'}]
+        with patch.object(gp, 'fetch_vod_catalog', return_value=[]):
+            merged = gp.fetch_multi_vod_catalog(configs)
+            assert merged == []
+
 
 class TestFindMovie:
     """Tests for find_movie()"""
@@ -408,10 +509,10 @@ class TestParseM3uMetadata:
         assert result is None
 
 
-class TestGenerateM3uContent:
-    """Tests for generate_m3u_content()"""
+class TestGenerateM3u:
+    """Tests for generate_m3u() unified pipeline"""
 
-    def test_generates_valid_m3u(self):
+    def test_generates_valid_m3u_from_video_data(self):
         config = {'iptv_server': 'http://s.com', 'iptv_username': 'u', 'iptv_password': 'p'}
         vod_index = {
             'test movie': {'name': 'Test Movie', 'stream_id': 123, 'container_extension': 'mp4', 'stream_icon': ''}
@@ -421,13 +522,36 @@ class TestGenerateM3uContent:
             'title': 'Video Title',
             'movies': [{'name': 'Test Movie', 'year': '2020'}]
         }]
+        movies = gp.movies_from_video_data(video_data)
+        header = [f"{gp.META_CHANNEL} @Channel"]
 
-        content, stats = gp.generate_m3u_content('@Channel', video_data, config, vod_index)
+        content, stats = gp.generate_m3u('@Channel', movies, config, vod_index, header_lines=header)
 
         assert '#EXTM3U' in content
         assert '# @channel: @Channel' in content
         assert stats['matched'] == 1
         assert 'http://s.com/movie/u/p/123.mp4' in content
+
+    def test_includes_source_metadata_when_present(self):
+        config = {'iptv_server': 'http://s.com', 'iptv_username': 'u', 'iptv_password': 'p'}
+        vod_index = {
+            'test movie': {
+                'name': 'Test Movie', 'stream_id': 123, 'container_extension': 'mp4', 'stream_icon': '',
+                '_source': {'name': 'xtreme', 'server': 'http://other.com', 'username': 'u2', 'password': 'p2'},
+            }
+        }
+        video_data = [{
+            'video_id': 'vid1',
+            'title': 'Video Title',
+            'movies': [{'name': 'Test Movie', 'year': '2020'}]
+        }]
+        movies = gp.movies_from_video_data(video_data)
+
+        content, stats = gp.generate_m3u('@Channel', movies, config, vod_index)
+
+        assert '# @source: xtreme' in content
+        # URL should use _source credentials, not config
+        assert 'http://other.com/movie/u2/p2/123.mp4' in content
 
     def test_tracks_unmatched_movies(self):
         config = {'iptv_server': 'http://s.com', 'iptv_username': 'u', 'iptv_password': 'p'}
@@ -437,11 +561,55 @@ class TestGenerateM3uContent:
             'title': 'Video Title',
             'movies': [{'name': 'Unknown Movie', 'year': '2020'}]
         }]
+        movies = gp.movies_from_video_data(video_data)
 
-        content, stats = gp.generate_m3u_content('@Channel', video_data, config, vod_index)
+        content, stats = gp.generate_m3u('@Channel', movies, config, vod_index)
 
         assert stats['unmatched'] == 1
         assert stats['matched'] == 0
+
+    def test_generates_valid_m3u_from_file_data(self):
+        config = {'iptv_server': 'http://s.com', 'iptv_username': 'u', 'iptv_password': 'p'}
+        vod_index = {
+            'who by fire': {'name': 'Who by Fire', 'stream_id': 123, 'container_extension': 'mp4', 'stream_icon': ''}
+        }
+        parsed = [{"title": "Comme le feu", "title_en": "Who by Fire", "year": "2024"}]
+        movies = gp.movies_from_file(parsed, "Quebec-Movies")
+        header = ["# @name: Quebec-Movies", "# @source_type: file"]
+
+        content, stats = gp.generate_m3u("Quebec-Movies", movies, config, vod_index, header_lines=header)
+
+        assert '#EXTM3U' in content
+        assert '# @name: Quebec-Movies' in content
+        assert '# @source_type: file' in content
+        assert stats['matched'] == 1
+        assert 'stream_id: 123' in content
+
+    def test_same_pipeline_for_all_sources(self):
+        """Both YouTube and file sources go through the same matching and rendering."""
+        config = {'iptv_server': 'http://s.com', 'iptv_username': 'u', 'iptv_password': 'p'}
+        vod_index = {
+            'test movie': {'name': 'Test Movie', 'stream_id': 99, 'container_extension': 'mp4', 'stream_icon': ''}
+        }
+
+        # From YouTube
+        yt_movies = gp.movies_from_video_data([{
+            'video_id': 'v1', 'title': 'Vid',
+            'movies': [{'name': 'Test Movie', 'year': '2020'}]
+        }])
+        yt_content, yt_stats = gp.generate_m3u('YT', yt_movies, config, vod_index)
+
+        # From file
+        file_movies = gp.movies_from_file(
+            [{"title": "Test Movie", "title_en": "", "year": "2020"}], "File"
+        )
+        file_content, file_stats = gp.generate_m3u('File', file_movies, config, vod_index)
+
+        # Same match results
+        assert yt_stats['matched'] == file_stats['matched'] == 1
+        # Both contain the stream URL
+        assert 'http://s.com/movie/u/p/99.mp4' in yt_content
+        assert 'http://s.com/movie/u/p/99.mp4' in file_content
 
 
 class TestListIptvxPlaylists:
@@ -486,10 +654,10 @@ class TestMain:
 
     def test_processes_channel_argument(self, capsys):
         with patch('sys.argv', ['generate_playlist.py', '@TestChannel']):
-            with patch.object(gp, 'load_config', return_value={
+            with patch.object(gp, 'load_configs', return_value=[{
                 'iptv_server': 'http://s.com', 'iptv_username': 'u', 'iptv_password': 'p', 'output_dir': 'playlists'
-            }):
-                with patch.object(gp, 'fetch_vod_catalog', return_value=[]):
+            }]):
+                with patch.object(gp, 'fetch_multi_vod_catalog', return_value=[]):
                     with pytest.raises(SystemExit):
                         gp.main()
 
@@ -536,7 +704,7 @@ class TestSyncPlaylists:
         config = {'output_dir': 'playlists', 'iptv_server': 'http://s.com', 'iptv_username': 'u', 'iptv_password': 'p'}
 
         with patch.object(gp, 'SCRIPT_DIR', tmp_path):
-            with patch.object(gp, 'fetch_vod_catalog', return_value=[]):
+            with patch.object(gp, 'fetch_multi_vod_catalog', return_value=[]):
                 gp.sync_playlists(config)
                 captured = capsys.readouterr()
                 assert 'Failed to fetch VOD catalog' in captured.out
@@ -548,7 +716,7 @@ class TestSyncPlaylists:
         config = {'output_dir': 'playlists', 'iptv_server': 'http://s.com', 'iptv_username': 'u', 'iptv_password': 'p'}
 
         with patch.object(gp, 'SCRIPT_DIR', tmp_path):
-            with patch.object(gp, 'fetch_vod_catalog', return_value=[{'name': 'Movie', 'stream_id': 1}]):
+            with patch.object(gp, 'fetch_multi_vod_catalog', return_value=[{'name': 'Movie', 'stream_id': 1}]):
                 gp.sync_playlists(config)
                 captured = capsys.readouterr()
                 assert 'Skipping' in captured.out
@@ -566,9 +734,9 @@ class TestSyncPlaylists:
         config = {'output_dir': 'playlists', 'iptv_server': 'http://s.com', 'iptv_username': 'u', 'iptv_password': 'p'}
 
         with patch.object(gp, 'SCRIPT_DIR', tmp_path):
-            with patch.object(gp, 'fetch_vod_catalog', return_value=[{'name': 'Movie', 'stream_id': 1}]):
+            with patch.object(gp, 'fetch_multi_vod_catalog', return_value=[{'name': 'Movie', 'stream_id': 1}]):
                 with patch.object(gp, 'process_channel', return_value=[]):
-                    with patch.object(gp, 'generate_m3u_content', return_value=('#EXTM3U\n', {'matched': 0, 'unmatched': 0, 'new_matched': 0, 'restored': 0, 'broken': 0, 'unavailable': 0})):
+                    with patch.object(gp, 'generate_m3u', return_value=('#EXTM3U\n', {'matched': 0, 'unmatched': 0, 'new_matched': 0, 'restored': 0, 'broken': 0, 'unavailable': 0})):
                         gp.sync_playlists(config)
                         captured = capsys.readouterr()
                         assert 'Syncing test.m3u' in captured.out
@@ -746,20 +914,37 @@ http://server.com/movie/u/p/123.mp4
         assert entry['video']['id'] == 'vid1'
         assert entry['movie']['name'] == 'Test Movie'
 
+    def test_parses_source_tag(self, tmp_path):
+        m3u_content = """#EXTM3U
+# @playlist_meta
+# @channel: @TestChannel
+# @synced: 2024-01-01 12:00:00
+# @videos_processed: vid1
+# @entry_start
+# @video: vid1 | Video Title
+# @movie: Test Movie | year: 2020 | matched
+# @source: xtreme
+# stream_id: 123
+#EXTINF:-1 tvg-name="Test Movie",Test Movie
+http://server.com/movie/u/p/123.mp4
+# @entry_end
+"""
+        m3u_file = tmp_path / "test.m3u"
+        m3u_file.write_text(m3u_content)
 
-class TestGenerateM3uContentAdditional:
-    """Additional tests for generate_m3u_content()"""
+        metadata = gp.parse_m3u_metadata(m3u_file)
+        entry = metadata['entries'][0]
+        assert entry['source'] == 'xtreme'
 
-    def test_handles_existing_metadata(self):
-        config = {'iptv_server': 'http://s.com', 'iptv_username': 'u', 'iptv_password': 'p'}
+
+class TestPreprocessExistingEntries:
+    """Tests for preprocess_existing_entries() and sync state transitions"""
+
+    def test_new_matched_from_unmatched(self):
         vod_index = {
             'test movie': {'name': 'Test Movie', 'stream_id': 123, 'container_extension': 'mp4', 'stream_icon': ''}
         }
-        video_data = []
-        existing_metadata = {
-            'channel': '@Channel',
-            'synced': '2024-01-01',
-            'videos_processed': {'vid1'},
+        metadata = {
             'entries': [{
                 'movie': {'name': 'Test Movie', 'year': '2020'},
                 'video': {'id': 'vid1', 'title': 'Test'},
@@ -769,18 +954,13 @@ class TestGenerateM3uContentAdditional:
             }]
         }
 
-        content, stats = gp.generate_m3u_content('@Channel', video_data, config, vod_index, existing_metadata)
-
-        assert stats['new_matched'] == 1  # was unmatched, now matched
+        entries = gp.preprocess_existing_entries(metadata, vod_index)
+        key = 'Test Movie|2020'
+        assert entries[key]['state'] == 'new_matched'
 
     def test_marks_unavailable_when_match_disappears(self):
-        config = {'iptv_server': 'http://s.com', 'iptv_username': 'u', 'iptv_password': 'p'}
         vod_index = {}  # Empty - previously matched movie no longer available
-        video_data = []
-        existing_metadata = {
-            'channel': '@Channel',
-            'synced': '2024-01-01',
-            'videos_processed': {'vid1'},
+        metadata = {
             'entries': [{
                 'movie': {'name': 'Missing Movie', 'year': '2020'},
                 'video': {'id': 'vid1', 'title': 'Test'},
@@ -790,20 +970,15 @@ class TestGenerateM3uContentAdditional:
             }]
         }
 
-        content, stats = gp.generate_m3u_content('@Channel', video_data, config, vod_index, existing_metadata)
-
-        assert stats['unavailable'] == 1
+        entries = gp.preprocess_existing_entries(metadata, vod_index)
+        key = 'Missing Movie|2020'
+        assert entries[key]['state'] == 'unavailable'
 
     def test_restores_previously_unavailable(self):
-        config = {'iptv_server': 'http://s.com', 'iptv_username': 'u', 'iptv_password': 'p'}
         vod_index = {
             'restored movie': {'name': 'Restored Movie', 'stream_id': 456, 'container_extension': 'mp4', 'stream_icon': ''}
         }
-        video_data = []
-        existing_metadata = {
-            'channel': '@Channel',
-            'synced': '2024-01-01',
-            'videos_processed': {'vid1'},
+        metadata = {
             'entries': [{
                 'movie': {'name': 'Restored Movie', 'year': '2020'},
                 'video': {'id': 'vid1', 'title': 'Test'},
@@ -813,9 +988,31 @@ class TestGenerateM3uContentAdditional:
             }]
         }
 
-        content, stats = gp.generate_m3u_content('@Channel', video_data, config, vod_index, existing_metadata)
+        entries = gp.preprocess_existing_entries(metadata, vod_index)
+        key = 'Restored Movie|2020'
+        assert entries[key]['state'] == 'restored'
 
-        assert stats['restored'] == 1
+    def test_state_transitions_through_full_pipeline(self):
+        """Verify preprocess + generate_m3u handles state transitions end-to-end."""
+        config = {'iptv_server': 'http://s.com', 'iptv_username': 'u', 'iptv_password': 'p'}
+        vod_index = {
+            'test movie': {'name': 'Test Movie', 'stream_id': 123, 'container_extension': 'mp4', 'stream_icon': ''}
+        }
+        metadata = {
+            'entries': [{
+                'movie': {'name': 'Test Movie', 'year': '2020'},
+                'video': {'id': 'vid1', 'title': 'Test'},
+                'state': 'unmatched',
+                'stream_id': None,
+                'lines': []
+            }]
+        }
+
+        existing = gp.preprocess_existing_entries(metadata, vod_index)
+        content, stats = gp.generate_m3u('@Ch', [], config, vod_index, existing_entries=existing)
+
+        assert stats['new_matched'] == 1
+        assert 'stream_id: 123' in content
 
 
 class TestMainAdditional:
@@ -826,11 +1023,11 @@ class TestMainAdditional:
         playlist_dir.mkdir()
 
         with patch('sys.argv', ['generate_playlist.py', '--sync']):
-            with patch.object(gp, 'load_config', return_value={
+            with patch.object(gp, 'load_configs', return_value=[{
                 'iptv_server': 'http://s.com', 'iptv_username': 'u', 'iptv_password': 'p', 'output_dir': 'playlists'
-            }):
+            }]):
                 with patch.object(gp, 'SCRIPT_DIR', tmp_path):
-                    with patch.object(gp, 'fetch_vod_catalog', return_value=[]):
+                    with patch.object(gp, 'fetch_multi_vod_catalog', return_value=[]):
                         gp.main()
                         captured = capsys.readouterr()
                         assert 'Failed to fetch VOD catalog' in captured.out
@@ -839,11 +1036,11 @@ class TestMainAdditional:
         playlist_dir = tmp_path / 'playlists'
 
         with patch('sys.argv', ['generate_playlist.py', '@TestChannel']):
-            with patch.object(gp, 'load_config', return_value={
+            with patch.object(gp, 'load_configs', return_value=[{
                 'iptv_server': 'http://s.com', 'iptv_username': 'u', 'iptv_password': 'p', 'output_dir': 'playlists'
-            }):
+            }]):
                 with patch.object(gp, 'SCRIPT_DIR', tmp_path):
-                    with patch.object(gp, 'fetch_vod_catalog', return_value=[{'name': 'Movie', 'stream_id': 1}]):
+                    with patch.object(gp, 'fetch_multi_vod_catalog', return_value=[{'name': 'Movie', 'stream_id': 1}]):
                         with patch.object(gp, 'process_channel', return_value=[{
                             'video_id': 'v1',
                             'title': 'Test',
@@ -852,6 +1049,57 @@ class TestMainAdditional:
                             gp.main()
                             # Check playlist was created
                             assert (playlist_dir / 'testchannel.m3u').exists()
+
+    def test_from_file_series_mode(self, tmp_path, capsys):
+        csv_file = tmp_path / 'shows.csv'
+        csv_file.write_text("title,start_year,genre\nTest Show,2020,Drame\n")
+        playlist_dir = tmp_path / 'playlists'
+
+        with patch('sys.argv', ['generate_playlist.py', '--from-file', str(csv_file),
+                                '--name', 'Test', '--type', 'series']):
+            with patch.object(gp, 'load_configs', return_value=[{
+                'iptv_server': 'http://s.com', 'iptv_username': 'u', 'iptv_password': 'p', 'output_dir': 'playlists'
+            }]):
+                with patch.object(gp, 'SCRIPT_DIR', tmp_path):
+                    with patch.object(gp, 'fetch_multi_series_catalog', return_value=[
+                        {'name': 'Test Show (2020)', 'title': 'Test Show', 'series_id': 1,
+                         'year': '2020', 'cover': '', '_source': {
+                             'name': 'p1', 'server': 'http://s.com', 'username': 'u', 'password': 'p'
+                         }}
+                    ]):
+                        with patch.object(gp, 'fetch_series_episodes', return_value=[
+                            {'id': 10, 'title': 'Pilot', 'season': 1, 'episode_num': 1, 'container_extension': 'mp4'}
+                        ]):
+                            gp.main()
+                            m3u = (playlist_dir / 'test.m3u')
+                            assert m3u.exists()
+                            content = m3u.read_text()
+                            assert '/series/' in content
+                            assert 'S01E01' in content
+
+    def test_from_file_append_mode(self, tmp_path, capsys):
+        playlist_dir = tmp_path / 'playlists'
+        playlist_dir.mkdir()
+        existing_m3u = playlist_dir / 'test.m3u'
+        existing_m3u.write_text('#EXTM3U\n# existing content\n')
+
+        csv_file = tmp_path / 'movies.csv'
+        csv_file.write_text("title,year\nTest Movie,2020\n")
+
+        with patch('sys.argv', ['generate_playlist.py', '--from-file', str(csv_file),
+                                '--name', 'Test', '--append']):
+            with patch.object(gp, 'load_configs', return_value=[{
+                'iptv_server': 'http://s.com', 'iptv_username': 'u', 'iptv_password': 'p', 'output_dir': 'playlists'
+            }]):
+                with patch.object(gp, 'SCRIPT_DIR', tmp_path):
+                    with patch.object(gp, 'fetch_multi_vod_catalog', return_value=[
+                        {'name': 'Test Movie', 'stream_id': 1, 'container_extension': 'mp4', 'stream_icon': ''}
+                    ]):
+                        with patch.object(gp, 'check_stream_url', return_value=True):
+                            gp.main()
+                            content = existing_m3u.read_text()
+                            assert '# existing content' in content
+                            assert 'Test Movie' in content
 
 
 class TestFetchVodCatalogAdditional:
@@ -913,3 +1161,459 @@ class TestProcessChannelAdditional:
             assert result == []
             captured = capsys.readouterr()
             assert 'No new videos' in captured.out
+
+
+class TestCheckRclone:
+    """Tests for _check_rclone()"""
+
+    def test_rclone_not_installed(self):
+        with patch('subprocess.run') as mock_run:
+            mock_run.return_value = MagicMock(returncode=1)
+            ok, err = gp._check_rclone()
+            assert ok is False
+            assert 'not installed' in err
+
+    def test_rclone_remote_not_configured(self):
+        with patch('subprocess.run') as mock_run:
+            def side_effect(cmd, **kwargs):
+                if cmd == ['which', 'rclone']:
+                    return MagicMock(returncode=0)
+                return MagicMock(returncode=0, stdout='other_remote:\n')
+            mock_run.side_effect = side_effect
+            ok, err = gp._check_rclone()
+            assert ok is False
+            assert 'not configured' in err
+
+    def test_rclone_configured(self):
+        with patch('subprocess.run') as mock_run:
+            def side_effect(cmd, **kwargs):
+                if cmd == ['which', 'rclone']:
+                    return MagicMock(returncode=0)
+                return MagicMock(returncode=0, stdout='gdrive:\n')
+            mock_run.side_effect = side_effect
+            ok, err = gp._check_rclone()
+            assert ok is True
+            assert err is None
+
+
+class TestAddPlaylistToIptvx:
+    """Tests for add_playlist_to_iptvx()"""
+
+    def test_returns_false_when_db_missing(self):
+        with patch.object(gp, 'IPTVX_SQLITE_PATH', Path('/nonexistent')):
+            assert gp.add_playlist_to_iptvx('test', 'http://url') is False
+
+    def test_updates_existing_playlist(self):
+        with patch.object(gp, 'IPTVX_SQLITE_PATH', Path('/fake/path')):
+            with patch.object(Path, 'exists', return_value=True):
+                with patch('sqlite3.connect') as mock_connect:
+                    mock_cursor = MagicMock()
+                    mock_cursor.fetchone.return_value = (1,)  # existing
+                    mock_conn = MagicMock()
+                    mock_conn.cursor.return_value = mock_cursor
+                    mock_conn.__enter__ = MagicMock(return_value=mock_conn)
+                    mock_conn.__exit__ = MagicMock(return_value=False)
+                    mock_connect.return_value = mock_conn
+
+                    assert gp.add_playlist_to_iptvx('test', 'http://url') is True
+
+    def test_returns_false_when_playlist_not_found(self):
+        with patch.object(gp, 'IPTVX_SQLITE_PATH', Path('/fake/path')):
+            with patch.object(Path, 'exists', return_value=True):
+                with patch('sqlite3.connect') as mock_connect:
+                    mock_cursor = MagicMock()
+                    mock_cursor.fetchone.return_value = None  # not found
+                    mock_conn = MagicMock()
+                    mock_conn.cursor.return_value = mock_cursor
+                    mock_conn.__enter__ = MagicMock(return_value=mock_conn)
+                    mock_conn.__exit__ = MagicMock(return_value=False)
+                    mock_connect.return_value = mock_conn
+
+                    assert gp.add_playlist_to_iptvx('test', 'http://url') is False
+
+    def test_handles_sqlite_error(self):
+        with patch.object(gp, 'IPTVX_SQLITE_PATH', Path('/fake/path')):
+            with patch.object(Path, 'exists', return_value=True):
+                with patch('sqlite3.connect', side_effect=sqlite3.Error("fail")):
+                    assert gp.add_playlist_to_iptvx('test', 'http://url') is False
+
+
+class TestUploadToGdrive:
+    """Tests for upload_to_gdrive()"""
+
+    def test_returns_none_when_rclone_not_configured(self, tmp_path):
+        with patch.object(gp, '_check_rclone', return_value=(False, 'not installed')):
+            assert gp.upload_to_gdrive(tmp_path / 'test.m3u') is None
+
+    def test_returns_none_on_upload_failure(self, tmp_path):
+        test_file = tmp_path / 'test.m3u'
+        test_file.write_text('#EXTM3U\n')
+        with patch.object(gp, '_check_rclone', return_value=(True, None)):
+            with patch('subprocess.run') as mock_run:
+                mock_run.return_value = MagicMock(returncode=1, stderr='error')
+                assert gp.upload_to_gdrive(test_file) is None
+
+    def test_successful_upload(self, tmp_path):
+        test_file = tmp_path / 'test.m3u'
+        test_file.write_text('#EXTM3U\n')
+        with patch.object(gp, '_check_rclone', return_value=(True, None)):
+            with patch('subprocess.run') as mock_run:
+                def side_effect(cmd, **kwargs):
+                    if 'copy' in cmd:
+                        return MagicMock(returncode=0)
+                    if 'lsjson' in cmd:
+                        return MagicMock(returncode=0, stdout=json.dumps([{'ID': 'file123'}]))
+                    return MagicMock(returncode=0)
+                mock_run.side_effect = side_effect
+                result = gp.upload_to_gdrive(test_file)
+                assert result is not None
+                assert result['file_id'] == 'file123'
+
+    def test_returns_none_on_lsjson_failure(self, tmp_path):
+        test_file = tmp_path / 'test.m3u'
+        test_file.write_text('#EXTM3U\n')
+        with patch.object(gp, '_check_rclone', return_value=(True, None)):
+            with patch('subprocess.run') as mock_run:
+                def side_effect(cmd, **kwargs):
+                    if 'copy' in cmd:
+                        return MagicMock(returncode=0)
+                    return MagicMock(returncode=1, stderr='error')
+                mock_run.side_effect = side_effect
+                assert gp.upload_to_gdrive(test_file) is None
+
+
+class TestShareFilePublic:
+    """Tests for share_file_public()"""
+
+    def test_returns_url_even_on_failure(self):
+        with patch.object(gp, '_check_rclone', return_value=(True, None)):
+            with patch('subprocess.run', return_value=MagicMock(returncode=1, stdout='[]')):
+                url = gp.share_file_public('file123')
+                assert 'file123' in url
+
+    def test_returns_none_when_rclone_missing(self):
+        with patch.object(gp, '_check_rclone', return_value=(False, 'error')):
+            assert gp.share_file_public('file123') is None
+
+    def test_calls_rclone_link_with_filename(self):
+        lsjson_result = MagicMock(returncode=0, stdout=json.dumps([
+            {'Name': 'test.m3u', 'ID': 'file123'}
+        ]))
+        link_result = MagicMock(returncode=0, stdout='https://drive.google.com/open?id=file123')
+        with patch.object(gp, '_check_rclone', return_value=(True, None)):
+            with patch('subprocess.run', side_effect=[lsjson_result, link_result]) as mock_run:
+                url = gp.share_file_public('file123')
+                assert 'file123' in url
+                # Second call should be rclone link with the filename
+                assert mock_run.call_count == 2
+                assert 'link' in mock_run.call_args_list[1][0][0]
+
+
+class TestUploadAndRegister:
+    """Tests for upload_and_register()"""
+
+    def test_returns_failure_when_upload_fails(self, tmp_path):
+        test_file = tmp_path / 'test.m3u'
+        test_file.write_text('#EXTM3U\n')
+        with patch.object(gp, 'upload_to_gdrive', return_value=None):
+            result = gp.upload_and_register(test_file, 'test')
+            assert result['uploaded'] is False
+
+    def test_full_success_flow(self, tmp_path):
+        test_file = tmp_path / 'test.m3u'
+        test_file.write_text('#EXTM3U\n')
+        with patch.object(gp, 'upload_to_gdrive', return_value={'file_id': 'f1', 'url': 'http://dl'}):
+            with patch.object(gp, 'share_file_public', return_value='http://shared'):
+                with patch.object(gp, 'add_playlist_to_iptvx', return_value=True):
+                    result = gp.upload_and_register(test_file, 'test')
+                    assert result['uploaded'] is True
+                    assert result['iptvx_updated'] is True
+
+    def test_needs_manual_add_when_iptvx_not_found(self, tmp_path):
+        test_file = tmp_path / 'test.m3u'
+        test_file.write_text('#EXTM3U\n')
+        with patch.object(gp, 'upload_to_gdrive', return_value={'file_id': 'f1', 'url': 'http://dl'}):
+            with patch.object(gp, 'share_file_public', return_value='http://shared'):
+                with patch.object(gp, 'add_playlist_to_iptvx', return_value=False):
+                    result = gp.upload_and_register(test_file, 'test')
+                    assert result['needs_manual_add'] is True
+
+
+class TestParseMovieFile:
+    """Tests for parse_movie_file()"""
+
+    def test_parses_csv_with_all_columns(self, tmp_path):
+        csv_file = tmp_path / "movies.csv"
+        csv_file.write_text(
+            "title,title_en,year,genre,director,imdb_search_url\n"
+            "Comme le feu,Who by Fire,2024,Drama,Philippe Lesage,http://imdb.com\n"
+            "The G,,2024,Thriller,Karl R. Hearne,http://imdb.com\n"
+        )
+        result = gp.parse_movie_file(str(csv_file))
+        assert len(result) == 2
+        assert result[0]["title"] == "Comme le feu"
+        assert result[0]["title_en"] == "Who by Fire"
+        assert result[0]["year"] == "2024"
+        assert result[1]["title_en"] == ""
+
+    def test_skips_empty_rows(self, tmp_path):
+        csv_file = tmp_path / "movies.csv"
+        csv_file.write_text(
+            "title,title_en,year\n"
+            ",,\n"
+            "Real Movie,,2024\n"
+        )
+        result = gp.parse_movie_file(str(csv_file))
+        assert len(result) == 1
+        assert result[0]["title"] == "Real Movie"
+
+    def test_missing_year_returns_none(self, tmp_path):
+        csv_file = tmp_path / "movies.csv"
+        csv_file.write_text(
+            "title,title_en,year\n"
+            "Some Movie,Some Movie EN,\n"
+        )
+        result = gp.parse_movie_file(str(csv_file))
+        assert result[0]["year"] is None
+
+    def test_exits_on_missing_file(self):
+        with pytest.raises(SystemExit):
+            gp.parse_movie_file("/nonexistent/file.csv")
+
+
+class TestMoviesFromFile:
+    """Tests for movies_from_file() and file-sourced pipeline"""
+
+    def setup_method(self):
+        self.config = {
+            "iptv_server": "http://server.com",
+            "iptv_username": "user",
+            "iptv_password": "pass",
+            "output_dir": "playlists",
+        }
+        self.vod_index = {
+            "who by fire": {
+                "name": "Who by Fire",
+                "stream_id": 123,
+                "container_extension": "mp4",
+                "stream_icon": "http://icon.jpg",
+                "year": "2024",
+                "_source": {"name": "provider1", "server": "http://server.com", "username": "user", "password": "pass"},
+            },
+            "the g": {
+                "name": "The G",
+                "stream_id": 456,
+                "container_extension": "mkv",
+                "stream_icon": "",
+                "year": "2024",
+                "_source": {"name": "provider1", "server": "http://server.com", "username": "user", "password": "pass"},
+            },
+        }
+
+    def _generate(self, parsed, name="Test"):
+        movies = gp.movies_from_file(parsed, name)
+        header = [f"# @name: {name}", "# @source_type: file"]
+        return gp.generate_m3u(name, movies, self.config, self.vod_index, header_lines=header)
+
+    def test_matches_by_english_title(self):
+        content, stats = self._generate(
+            [{"title": "Comme le feu", "title_en": "Who by Fire", "year": "2024"}],
+            "Quebec-Movies",
+        )
+        assert stats["matched"] == 1
+        assert stats["unmatched"] == 0
+        assert "stream_id: 123" in content
+        assert "Quebec-Movies" in content
+
+    def test_matches_by_original_title_first(self):
+        self.vod_index["comme le feu"] = {
+            "name": "Comme le feu",
+            "stream_id": 789,
+            "container_extension": "mp4",
+            "stream_icon": "",
+            "_source": {"name": "p1", "server": "http://s.com", "username": "u", "password": "p"},
+        }
+        content, stats = self._generate(
+            [{"title": "Comme le feu", "title_en": "Who by Fire", "year": "2024"}],
+        )
+        assert stats["matched"] == 1
+        assert "stream_id: 789" in content
+
+    def test_unmatched_movie(self):
+        content, stats = self._generate(
+            [{"title": "Nonexistent Movie", "title_en": "", "year": "2024"}],
+        )
+        assert stats["matched"] == 0
+        assert stats["unmatched"] == 1
+        assert "unmatched" in content
+
+    def test_m3u_header_contains_metadata(self):
+        content, stats = self._generate(
+            [{"title": "The G", "title_en": "", "year": "2024"}],
+            "Quebec-Movies",
+        )
+        assert "#EXTM3U" in content
+        assert "# @name: Quebec-Movies" in content
+        assert "# @source_type: file" in content
+
+    def test_includes_english_title_comment(self):
+        content, stats = self._generate(
+            [{"title": "Comme le feu", "title_en": "Who by Fire", "year": "2024"}],
+        )
+        assert "# @title_en: Who by Fire" in content
+
+    def test_empty_movie_list(self):
+        content, stats = self._generate([])
+        assert stats["matched"] == 0
+        assert stats["unmatched"] == 0
+        assert "#EXTM3U" in content
+
+
+class TestMoviesFromVideoData:
+    """Tests for movies_from_video_data()"""
+
+    def test_converts_video_data_to_common_format(self):
+        video_data = [{
+            'video_id': 'vid1',
+            'title': 'Top 10 Horror',
+            'movies': [
+                {'name': 'Movie A', 'year': '2020'},
+                {'name': 'Movie B'},
+            ]
+        }]
+        result = gp.movies_from_video_data(video_data)
+        assert len(result) == 2
+        assert result[0]['name'] == 'Movie A'
+        assert result[0]['year'] == '2020'
+        assert result[0]['group'] == 'Top 10 Horror'
+        assert result[0]['search_titles'] == ['Movie A']
+        assert any('vid1' in ml for ml in result[0]['meta_lines'])
+
+    def test_empty_video_data(self):
+        assert gp.movies_from_video_data([]) == []
+
+
+class TestFetchSeriesCatalog:
+    """Tests for fetch_series_catalog()"""
+
+    def test_fetches_and_parses_series(self):
+        config = {'iptv_server': 'http://s.com', 'iptv_username': 'u', 'iptv_password': 'p'}
+        series_json = json.dumps([
+            {'name': 'Show (2020)', 'title': 'Show', 'series_id': 100, 'year': '2020'},
+        ])
+
+        with patch('subprocess.run') as mock_run:
+            mock_run.return_value = MagicMock(returncode=0)
+            with patch('builtins.open', mock_open(read_data=series_json)):
+                with patch('os.path.exists', return_value=True):
+                    with patch('os.unlink'):
+                        result = gp.fetch_series_catalog(config)
+                        assert len(result) == 1
+                        assert result[0]['series_id'] == 100
+
+    def test_returns_empty_on_failure(self):
+        config = {'iptv_server': 'http://s.com', 'iptv_username': 'u', 'iptv_password': 'p'}
+        with patch('subprocess.run') as mock_run:
+            mock_run.return_value = MagicMock(returncode=1)
+            with patch('os.path.exists', return_value=True):
+                with patch('os.unlink'):
+                    result = gp.fetch_series_catalog(config)
+                    assert result == []
+
+
+class TestFetchMultiSeriesCatalog:
+    """Tests for fetch_multi_series_catalog()"""
+
+    def test_merges_catalogs_with_source(self):
+        configs = [
+            {'iptv_server': 'http://a.com', 'iptv_username': 'u1', 'iptv_password': 'p1', '_name': 'prov1'},
+        ]
+        with patch.object(gp, 'fetch_series_catalog', return_value=[
+            {'name': 'Show A', 'series_id': 1},
+        ]):
+            result = gp.fetch_multi_series_catalog(configs)
+            assert len(result) == 1
+            assert result[0]['_source']['name'] == 'prov1'
+
+
+class TestFetchSeriesEpisodes:
+    """Tests for fetch_series_episodes()"""
+
+    def test_parses_episodes(self):
+        config = {'iptv_server': 'http://s.com', 'iptv_username': 'u', 'iptv_password': 'p'}
+        series_info = json.dumps({
+            'episodes': {
+                '1': [
+                    {'id': 10, 'title': 'Pilot', 'season': 1, 'episode_num': 1, 'container_extension': 'mkv'},
+                    {'id': 11, 'title': 'Ep 2', 'season': 1, 'episode_num': 2, 'container_extension': 'mkv'},
+                ],
+            }
+        })
+        with patch('subprocess.run', return_value=MagicMock(returncode=0, stdout=series_info)):
+            result = gp.fetch_series_episodes(config, 100)
+            assert len(result) == 2
+            assert result[0]['id'] == 10
+            assert result[0]['season'] == 1
+            assert result[0]['container_extension'] == 'mkv'
+
+    def test_returns_empty_on_error(self):
+        config = {'iptv_server': 'http://s.com', 'iptv_username': 'u', 'iptv_password': 'p'}
+        with patch('subprocess.run', return_value=MagicMock(returncode=1, stdout='')):
+            assert gp.fetch_series_episodes(config, 999) == []
+
+
+class TestBuildSeriesStreamUrl:
+    """Tests for build_series_stream_url()"""
+
+    def test_builds_url_from_source(self):
+        series = {'_source': {'server': 'http://s.com', 'username': 'u', 'password': 'p'}}
+        url = gp.build_series_stream_url(series, 42, 'mkv')
+        assert url == 'http://s.com/series/u/p/42.mkv'
+
+
+class TestParseMovieFileStartYear:
+    """Tests for parse_movie_file() with start_year column (TV shows)"""
+
+    def test_normalizes_start_year_to_year(self, tmp_path):
+        csv_file = tmp_path / "shows.csv"
+        csv_file.write_text(
+            "title,start_year,end_year,genre\n"
+            "Lance et compte,1986,2015,Drame sportif\n"
+        )
+        result = gp.parse_movie_file(str(csv_file))
+        assert len(result) == 1
+        assert result[0]["year"] == "1986"
+        assert result[0]["genre"] == "Drame sportif"
+
+    def test_preserves_all_columns(self, tmp_path):
+        csv_file = tmp_path / "shows.csv"
+        csv_file.write_text(
+            "title,start_year,end_year,genre\n"
+            "Show A,2020,2023,Comédie\n"
+        )
+        result = gp.parse_movie_file(str(csv_file))
+        assert result[0]["start_year"] == "2020"
+        assert result[0]["end_year"] == "2023"
+        assert result[0]["genre"] == "Comédie"
+
+
+class TestMoviesFromFileGroupBy:
+    """Tests for movies_from_file() group_by with multiple columns"""
+
+    def test_group_by_single_column(self):
+        parsed = [{"title": "Movie", "year": "2024", "genre": "Drame"}]
+        entries = gp.movies_from_file(parsed, "Test", group_by="year")
+        assert len(entries) == 1
+        assert entries[0]["group"] == "2024"
+
+    def test_group_by_multiple_creates_duplicates(self):
+        parsed = [{"title": "Movie", "year": "2024", "genre": "Drame"}]
+        entries = gp.movies_from_file(parsed, "Test", group_by=["year", "genre"])
+        assert len(entries) == 2
+        groups = {e["group"] for e in entries}
+        assert groups == {"2024", "Drame"}
+
+    def test_fallback_to_playlist_name(self):
+        parsed = [{"title": "Movie"}]
+        entries = gp.movies_from_file(parsed, "Fallback", group_by=["year"])
+        assert entries[0]["group"] == "Fallback"

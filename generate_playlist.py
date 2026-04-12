@@ -15,6 +15,7 @@ Usage:
 """
 
 import argparse
+import csv
 import json
 import os
 import re
@@ -47,6 +48,7 @@ META_VIDEO = "# @video:"
 META_MOVIE = "# @movie:"
 META_ENTRY_START = "# @entry_start"
 META_ENTRY_END = "# @entry_end"
+META_SOURCE = "# @source:"
 
 
 # =============================================================================
@@ -165,16 +167,25 @@ def share_file_public(file_id):
         print(f"Error: {err}")
         return None
 
-    # Use rclone backend command to set permissions
-    cmd = [
-        'rclone', 'backend', 'publiclink',
-        f'{RCLONE_REMOTE}:', '-o', f'id={file_id}'
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    # Use rclone link to set "anyone with link" permissions
+    # Note: 'rclone backend publiclink' doesn't work reliably — use 'rclone link' instead
+    cmd = ['rclone', 'link', f'{RCLONE_REMOTE}:']
+    # We need the filename, so look it up
+    lsjson_cmd = ['rclone', 'lsjson', f'{RCLONE_REMOTE}:', '--files-only']
+    lsjson_result = subprocess.run(lsjson_cmd, capture_output=True, text=True)
+    filename = None
+    if lsjson_result.returncode == 0:
+        try:
+            for item in json.loads(lsjson_result.stdout):
+                if item.get('ID') == file_id:
+                    filename = item.get('Name')
+                    break
+        except (json.JSONDecodeError, KeyError):
+            pass
 
-    if result.returncode != 0:
-        # Try alternative: use Google Drive link directly (file may already be in shared folder)
-        pass
+    if filename:
+        cmd = ['rclone', 'link', f'{RCLONE_REMOTE}:{filename}']
+        subprocess.run(cmd, capture_output=True, text=True)
 
     return f"https://drive.google.com/uc?export=download&id={file_id}"
 
@@ -340,33 +351,67 @@ def select_playlist(playlists, playlist_name=None):
             sys.exit(0)
 
 
-def load_config(playlist_name=None):
-    """Load IPTV config from IPTVX database or environment."""
-    config = DEFAULT_CONFIG.copy()
+def load_configs(playlist_name=None):
+    """Load IPTV configs from IPTVX database or environment.
 
-    # Try IPTVX database first
+    Returns a list of config dicts. When no --playlist flag is given and
+    multiple IPTVX playlists exist, ALL are returned (no interactive prompt).
+    With --playlist or env vars, returns a single-element list.
+
+    Args:
+        playlist_name: Optional name to select a single playlist.
+
+    Returns:
+        List of config dicts, each with iptv_server/username/password/output_dir.
+    """
+    # Check environment override first — always single source
+    env_server = os.environ.get("IPTV_SERVER", "")
+    env_user = os.environ.get("IPTV_USERNAME", "")
+    env_pass = os.environ.get("IPTV_PASSWORD", "")
+    if all([env_server, env_user, env_pass]):
+        config = DEFAULT_CONFIG.copy()
+        config["iptv_server"] = env_server
+        config["iptv_username"] = env_user
+        config["iptv_password"] = env_pass
+        return [config]
+
     playlists = get_iptvx_playlists()
-    if playlists:
+
+    if playlist_name:
+        # Specific playlist requested — use select_playlist (may exit on error)
         selected = select_playlist(playlists, playlist_name)
         if selected:
+            config = DEFAULT_CONFIG.copy()
             config["iptv_server"] = selected["server"]
             config["iptv_username"] = selected["username"]
             config["iptv_password"] = selected["password"]
+            return [config]
 
-    # Override from environment
-    for key in ["iptv_server", "iptv_username", "iptv_password"]:
-        env_key = key.upper()
-        if os.environ.get(env_key):
-            config[key] = os.environ[env_key]
+    if playlists:
+        # No specific playlist — use ALL available playlists
+        configs = []
+        for p in playlists:
+            config = DEFAULT_CONFIG.copy()
+            config["iptv_server"] = p["server"]
+            config["iptv_username"] = p["username"]
+            config["iptv_password"] = p["password"]
+            config["_name"] = p["name"]
+            configs.append(config)
+        names = ", ".join(c["_name"] for c in configs)
+        print(f"Using {len(configs)} IPTVX playlists: {names}")
+        return configs
 
-    if not all([config["iptv_server"], config["iptv_username"], config["iptv_password"]]):
-        print("Error: IPTV credentials not found.")
-        print("Options:")
-        print("  - Configure a playlist in IPTVX app")
-        print("  - Set IPTV_SERVER, IPTV_USERNAME, IPTV_PASSWORD environment variables")
-        sys.exit(1)
+    print("Error: IPTV credentials not found.")
+    print("Options:")
+    print("  - Configure a playlist in IPTVX app")
+    print("  - Set IPTV_SERVER, IPTV_USERNAME, IPTV_PASSWORD environment variables")
+    sys.exit(1)
 
-    return config
+
+def load_config(playlist_name=None):
+    """Load single IPTV config. Thin wrapper around load_configs() for backward compat."""
+    configs = load_configs(playlist_name)
+    return configs[0]
 
 
 def run_command(cmd, timeout=300):
@@ -566,13 +611,147 @@ def fetch_vod_catalog(config):
             os.unlink(tmp_path)
 
 
+def fetch_multi_vod_catalog(configs):
+    """Fetch and merge VOD catalogs from multiple providers.
+
+    Each item is stamped with a _source dict containing the server credentials
+    it came from, so build_stream_url() can construct the correct URL.
+
+    Args:
+        configs: List of config dicts.
+
+    Returns:
+        Merged list of VOD items (first config's items listed first = higher priority).
+    """
+    merged = []
+    for config in configs:
+        name = config.get("_name", config["iptv_server"])
+        data = fetch_vod_catalog(config)
+        for item in data:
+            item["_source"] = {
+                "name": name,
+                "server": config["iptv_server"],
+                "username": config["iptv_username"],
+                "password": config["iptv_password"],
+            }
+        merged.extend(data)
+    return merged
+
+
+def fetch_series_catalog(config):
+    """Fetch series catalog from provider API."""
+    print("Fetching series catalog from provider...")
+    url = f"{config['iptv_server']}/player_api.php?username={config['iptv_username']}&password={config['iptv_password']}&action=get_series"
+
+    import tempfile
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as tmp:
+        tmp_path = tmp.name
+
+    try:
+        cmd = ['curl', '-s', '--max-time', '180', '-o', tmp_path, url]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=200)
+
+        if result.returncode != 0:
+            print("Error: Failed to fetch series catalog from provider.")
+            return []
+
+        with open(tmp_path, 'r') as f:
+            data = json.load(f)
+
+        print(f"Loaded {len(data)} series from provider")
+        return data
+    except json.JSONDecodeError:
+        print("Error: Series catalog response is not valid JSON.")
+        return []
+    except subprocess.TimeoutExpired:
+        print("Error: Series catalog fetch timed out.")
+        return []
+    except Exception as e:
+        print(f"Error fetching series catalog: {e}")
+        return []
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+
+def fetch_multi_series_catalog(configs):
+    """Fetch and merge series catalogs from multiple providers."""
+    merged = []
+    for config in configs:
+        name = config.get("_name", config["iptv_server"])
+        data = fetch_series_catalog(config)
+        for item in data:
+            item["_source"] = {
+                "name": name,
+                "server": config["iptv_server"],
+                "username": config["iptv_username"],
+                "password": config["iptv_password"],
+            }
+        merged.extend(data)
+    return merged
+
+
+def fetch_series_episodes(config, series_id):
+    """Fetch episode list for a series.
+
+    Args:
+        config: IPTV config dict.
+        series_id: Series ID from the catalog.
+
+    Returns:
+        List of episode dicts with 'id', 'title', 'season', 'episode_num',
+        'container_extension', 'info' keys.
+    """
+    url = (f"{config['iptv_server']}/player_api.php?"
+           f"username={config['iptv_username']}&password={config['iptv_password']}"
+           f"&action=get_series_info&series_id={series_id}")
+
+    try:
+        cmd = ['curl', '-s', '--max-time', '30', url]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=35)
+        if result.returncode != 0:
+            return []
+
+        data = json.loads(result.stdout)
+        episodes = []
+        for season_num, eps in data.get("episodes", {}).items():
+            for ep in eps:
+                episodes.append({
+                    "id": ep.get("id"),
+                    "title": ep.get("title", ""),
+                    "season": int(ep.get("season", season_num)),
+                    "episode_num": int(ep.get("episode_num", 0)),
+                    "container_extension": ep.get("container_extension", "mp4"),
+                })
+        return episodes
+    except Exception:
+        return []
+
+
+def build_series_stream_url(series_item, episode_id, ext="mp4"):
+    """Build stream URL for a series episode.
+
+    Args:
+        series_item: Series dict (may contain _source with credentials).
+        episode_id: Episode stream ID.
+        ext: File extension.
+    """
+    source = series_item.get("_source", {})
+    server = source.get("server", "")
+    username = source.get("username", "")
+    password = source.get("password", "")
+    return f"{server}/series/{username}/{password}/{episode_id}.{ext}"
+
+
 def build_vod_index(vod_data):
-    """Build searchable index."""
+    """Build searchable index. First-wins dedup preserves priority order."""
     index = {}
     for item in vod_data:
         name = item.get("name")
         if name:
-            index[name.lower()] = item
+            key = name.lower()
+            if key not in index:
+                index[key] = item
     return index
 
 
@@ -605,11 +784,213 @@ def find_movie(title, year, vod_index):
     return None
 
 
+def build_stream_url(result, config=None):
+    """Build stream URL from a VOD result, using embedded _source or fallback config.
+
+    Args:
+        result: VOD item dict (may contain _source with server credentials).
+        config: Fallback config dict with iptv_server/username/password.
+
+    Returns:
+        Full stream URL string.
+    """
+    source = result.get("_source", {})
+    server = source.get("server") or config["iptv_server"]
+    username = source.get("username") or config["iptv_username"]
+    password = source.get("password") or config["iptv_password"]
+    stream_id = result.get("stream_id")
+    ext = result.get("container_extension", "mp4")
+    return f"{server}/movie/{username}/{password}/{stream_id}.{ext}"
+
+
 def sanitize_filename(name):
     """Convert channel name to safe filename."""
     name = name.lstrip("@").lower()
     name = re.sub(r"[^a-z0-9]+", "-", name)
     return name.strip("-")
+
+
+def parse_movie_file(filepath):
+    """Parse a CSV file containing movie information.
+
+    Expected columns: title, year (required), title_en (optional).
+    All columns are preserved for use with --group-by.
+
+    Args:
+        filepath: Path to the CSV file.
+
+    Returns:
+        List of dicts with all CSV columns (values stripped, empty year → None).
+    """
+    filepath = Path(filepath)
+    if not filepath.exists():
+        print(f"Error: File not found: {filepath}")
+        sys.exit(1)
+
+    movies = []
+    with open(filepath, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            entry = {k: v.strip() for k, v in row.items()}
+            # Normalize start_year → year (for TV shows CSV)
+            if "start_year" in entry and "year" not in entry:
+                entry["year"] = entry["start_year"]
+            if not entry.get("year", ""):
+                entry["year"] = None
+            title = entry.get("title", "")
+            title_en = entry.get("title_en", "")
+            if title or title_en:
+                movies.append(entry)
+
+    return movies
+
+
+def movies_from_file(parsed_movies, playlist_name, group_by=None):
+    """Convert parsed CSV movies to common movie entry format.
+
+    Args:
+        parsed_movies: List of dicts from parse_movie_file().
+        playlist_name: Playlist name for group-title fallback.
+        group_by: CSV column name or list of column names for group-title.
+            Multiple columns create duplicate entries so each movie appears
+            under each group independently (e.g. under '2024' AND 'Drame').
+
+    Returns:
+        List of common movie entry dicts.
+    """
+    if isinstance(group_by, str):
+        group_by = [group_by]
+
+    entries = []
+    for movie in parsed_movies:
+        title = movie.get("title", "")
+        title_en = movie.get("title_en", "")
+        # Use the first non-empty title column as display name
+        name = title or title_en
+        if not name:
+            # Try any column ending in title_ prefix (title_kr, title_fr, etc.)
+            for k, v in movie.items():
+                if k.startswith("title_") and v:
+                    name = v
+                    break
+
+        search_titles = []
+        if title:
+            search_titles.append(title)
+        if title_en:
+            search_titles.append(title_en)
+        # Add any other title_* columns as search alternatives
+        for k, v in movie.items():
+            if k.startswith("title_") and k != "title_en" and v and v not in search_titles:
+                search_titles.append(v)
+
+        meta = []
+        if title_en and title:
+            meta.append(f"# @title_en: {title_en}")
+
+        groups = []
+        if group_by:
+            groups = [movie[col] for col in group_by if movie.get(col)]
+        if not groups:
+            groups = [playlist_name]
+
+        for group in groups:
+            entries.append({
+                "name": name,
+                "year": movie.get("year"),
+                "search_titles": search_titles,
+                "group": group,
+                "meta_lines": list(meta),
+            })
+    return entries
+
+
+def movies_from_video_data(video_data):
+    """Convert YouTube video_data to common movie entry format.
+
+    Args:
+        video_data: List of dicts from process_channel().
+
+    Returns:
+        List of common movie entry dicts.
+    """
+    entries = []
+    for video in video_data:
+        video_line = f"{META_VIDEO} {video['video_id']} | {video['title']}"
+        for movie in video.get("movies", []):
+            entries.append({
+                "name": movie["name"],
+                "year": movie.get("year"),
+                "search_titles": [movie["name"]],
+                "group": video["title"],
+                "meta_lines": [video_line],
+            })
+    return entries
+
+
+def preprocess_existing_entries(existing_metadata, vod_index):
+    """Re-match existing M3U entries against current VOD catalog.
+
+    Handles state transitions: matched->unavailable, unmatched->matched, etc.
+
+    Args:
+        existing_metadata: Dict from parse_m3u_metadata().
+        vod_index: Current VOD search index.
+
+    Returns:
+        Dict of movie_key -> entry dicts with updated states.
+    """
+    entries = {}
+    for entry in existing_metadata.get("entries", []):
+        movie = entry.get("movie", {})
+        movie_key = f"{movie.get('name', '')}|{movie.get('year', '')}"
+
+        if movie_key in entries:
+            continue
+
+        result = find_movie(movie.get("name", ""), movie.get("year"), vod_index)
+
+        meta_lines = []
+        video = entry.get("video")
+        if video:
+            meta_lines.append(f"{META_VIDEO} {video['id']} | {video['title']}")
+
+        group = video.get("title", "Movies") if video else "Movies"
+
+        if result:
+            if entry["state"] == "unavailable":
+                state = "restored"
+            elif entry["state"] == "unmatched":
+                state = "new_matched"
+            else:
+                state = "matched"
+
+            entries[movie_key] = {
+                "movie": movie,
+                "state": state,
+                "result": result,
+                "group": group,
+                "meta_lines": meta_lines,
+            }
+        elif entry["state"] == "matched":
+            entries[movie_key] = {
+                "movie": movie,
+                "state": "unavailable",
+                "result": None,
+                "group": group,
+                "meta_lines": meta_lines,
+                "prev_stream_id": entry.get("stream_id"),
+            }
+        else:
+            entries[movie_key] = {
+                "movie": movie,
+                "state": "unmatched",
+                "result": None,
+                "group": group,
+                "meta_lines": meta_lines,
+            }
+
+    return entries
 
 
 def parse_m3u_metadata(filepath):
@@ -640,7 +1021,7 @@ def parse_m3u_metadata(filepath):
                 metadata["videos_processed"] = set(vids.split(","))
         elif line.startswith(META_ENTRY_START):
             # Parse entry block
-            entry = {"lines": [], "movie": None, "video": None, "state": None, "stream_id": None}
+            entry = {"lines": [], "movie": None, "video": None, "state": None, "stream_id": None, "source": None}
             i += 1
             while i < len(lines) and not lines[i].strip().startswith(META_ENTRY_END):
                 entry_line = lines[i]
@@ -664,6 +1045,8 @@ def parse_m3u_metadata(filepath):
                             movie_info["name"] = part
                     entry["movie"] = movie_info
                     entry["state"] = movie_info.get("state", "unmatched")
+                elif entry_line.strip().startswith(META_SOURCE):
+                    entry["source"] = entry_line.strip()[len(META_SOURCE):].strip()
                 elif "stream_id:" in entry_line:
                     match = re.search(r"stream_id:\s*(\d+)", entry_line)
                     if match:
@@ -676,187 +1059,193 @@ def parse_m3u_metadata(filepath):
     return metadata
 
 
-def generate_m3u_content(channel_handle, video_data, config, vod_index, existing_metadata=None, validate_urls=False, workers=5):
-    """Generate M3U playlist content with metadata."""
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+def generate_m3u(playlist_name, movies, config, vod_index,
+                 existing_entries=None, validate_urls=False, workers=5,
+                 header_lines=None):
+    """Unified M3U generation pipeline.
 
-    # Collect all processed video IDs
-    processed_videos = set()
-    if existing_metadata:
-        processed_videos = existing_metadata["videos_processed"].copy()
-    for video in video_data:
-        processed_videos.add(video["video_id"])
+    Takes movies from any source (YouTube, CSV, etc.), matches against VOD
+    catalog, optionally validates stream URLs, and renders an M3U playlist.
+    Same quality checks regardless of source.
+
+    Args:
+        playlist_name: Display name for the playlist.
+        movies: List of common movie entry dicts:
+            - name: Display name (required)
+            - year: Year string or None
+            - search_titles: Titles to try matching in order (defaults to [name])
+            - group: M3U group-title (defaults to playlist_name)
+            - meta_lines: Extra comment lines for the M3U entry
+        config: Primary IPTV config (for stream URL building).
+        vod_index: Pre-built VOD search index.
+        existing_entries: Dict of movie_key -> entry dicts from
+            preprocess_existing_entries() (sync mode).
+        validate_urls: Whether to check stream accessibility.
+        workers: Parallel workers for URL validation.
+        header_lines: Extra lines for M3U header (after standard metadata).
+
+    Returns:
+        Tuple of (m3u_content_string, stats_dict).
+    """
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     lines = [
         "#EXTM3U",
         META_HEADER,
-        f"{META_CHANNEL} {channel_handle}",
         f"{META_SYNCED} {timestamp}",
-        f"{META_VIDEOS} {','.join(sorted(processed_videos))}",
-        f"# Source: https://www.youtube.com/{channel_handle}",
-        "",
     ]
+    if header_lines:
+        lines.extend(header_lines)
+    lines.append("")
 
-    stats = {"matched": 0, "unmatched": 0, "unavailable": 0, "restored": 0, "new_matched": 0, "broken": 0}
-    entries_by_movie_key = {}  # Track entries to avoid duplicates
-    urls_to_validate = []  # Collect URLs for batch validation
+    stats = {"matched": 0, "unmatched": 0, "unavailable": 0,
+             "restored": 0, "new_matched": 0, "broken": 0}
+    entries_by_movie_key = {}
 
-    # Process existing entries first (for sync mode)
-    if existing_metadata:
-        for entry in existing_metadata["entries"]:
-            movie = entry.get("movie", {})
-            movie_key = f"{movie.get('name', '')}|{movie.get('year', '')}"
-
-            if movie_key in entries_by_movie_key:
-                continue
-
-            # Try to re-match
-            result = find_movie(movie.get("name", ""), movie.get("year"), vod_index)
-
-            if result:
-                if entry["state"] == "unavailable":
-                    stats["restored"] += 1
-                    new_state = "matched"
-                elif entry["state"] == "unmatched":
-                    stats["new_matched"] += 1
-                    new_state = "matched"
-                else:
-                    stats["matched"] += 1
-                    new_state = "matched"
-
-                entries_by_movie_key[movie_key] = {
-                    "movie": movie,
-                    "video": entry.get("video"),
-                    "state": new_state,
-                    "result": result,
-                }
-            elif entry["state"] == "matched":
-                # Was matched, now unavailable in catalog
-                stats["unavailable"] += 1
-                entries_by_movie_key[movie_key] = {
-                    "movie": movie,
-                    "video": entry.get("video"),
-                    "state": "unavailable",
-                    "result": None,
-                    "prev_stream_id": entry.get("stream_id"),
-                }
-            else:
-                stats["unmatched"] += 1
-                entries_by_movie_key[movie_key] = {
-                    "movie": movie,
-                    "video": entry.get("video"),
-                    "state": "unmatched",
-                    "result": None,
-                }
-
-    # Process new video data
-    for video in video_data:
-        group_title = video["title"]
-        video_info = {"id": video["video_id"], "title": video["title"]}
-
-        for movie in video.get("movies", []):
-            movie_key = f"{movie['name']}|{movie.get('year', '')}"
-
-            if movie_key in entries_by_movie_key:
-                continue
-
-            result = find_movie(movie["name"], movie.get("year"), vod_index)
-
-            if result:
+    # Merge pre-processed existing entries (sync mode)
+    if existing_entries:
+        for key, entry in existing_entries.items():
+            entries_by_movie_key[key] = entry
+            state = entry.get("state", "unmatched")
+            if state == "restored":
+                stats["restored"] += 1
+                entry["state"] = "matched"
+            elif state == "new_matched":
+                stats["new_matched"] += 1
+                entry["state"] = "matched"
+            elif state == "matched":
                 stats["matched"] += 1
-                entries_by_movie_key[movie_key] = {
-                    "movie": {"name": movie["name"], "year": movie.get("year")},
-                    "video": video_info,
-                    "state": "matched",
-                    "result": result,
-                }
+            elif state == "unavailable":
+                stats["unavailable"] += 1
             else:
                 stats["unmatched"] += 1
-                entries_by_movie_key[movie_key] = {
-                    "movie": {"name": movie["name"], "year": movie.get("year")},
-                    "video": video_info,
-                    "state": "unmatched",
-                    "result": None,
-                }
 
-    # Validate URLs if requested (parallelized for speed)
+    # Match new movies
+    # Cache match results by movie identity to avoid redundant VOD lookups
+    # when the same movie appears under multiple groups.
+    match_cache = {}
+    for movie in movies:
+        name = movie["name"]
+        year = movie.get("year")
+        group = movie.get("group", playlist_name)
+        movie_key = f"{name}|{year or ''}|{group}"
+
+        if movie_key in entries_by_movie_key:
+            continue
+
+        # Reuse match result if we already looked up this movie
+        identity = f"{name}|{year or ''}"
+        if identity in match_cache:
+            result = match_cache[identity]
+        else:
+            search_titles = movie.get("search_titles", [name])
+            result = None
+            for title in search_titles:
+                if title:
+                    result = find_movie(title, year, vod_index)
+                if result:
+                    break
+            match_cache[identity] = result
+
+        state = "matched" if result else "unmatched"
+        stats[state] += 1
+
+        entries_by_movie_key[movie_key] = {
+            "movie": {"name": name, "year": year},
+            "state": state,
+            "result": result,
+            "group": movie.get("group", playlist_name),
+            "meta_lines": movie.get("meta_lines", []),
+        }
+
+    # Validate URLs (parallelized)
     if validate_urls:
         from concurrent.futures import ThreadPoolExecutor, as_completed
         import threading
 
-        matched_entries = [(k, e) for k, e in entries_by_movie_key.items() if e["state"] == "matched" and e.get("result")]
-        total = len(matched_entries)
-        print(f"  Validating {total} stream URLs (parallel)...")
+        matched_entries = [(k, e) for k, e in entries_by_movie_key.items()
+                          if e["state"] == "matched" and e.get("result")]
 
-        # Prepare URL check tasks
-        def check_entry(movie_key, entry):
-            result = entry["result"]
-            stream_id = result.get("stream_id")
-            ext = result.get("container_extension", "mp4")
-            url = f"{config['iptv_server']}/movie/{config['iptv_username']}/{config['iptv_password']}/{stream_id}.{ext}"
-            is_valid = check_stream_url(url)
-            return movie_key, entry, stream_id, is_valid
+        # Deduplicate by stream_id so the same URL isn't checked twice
+        # (happens when a movie appears under multiple groups)
+        seen_streams = {}  # stream_id -> list of (movie_key, entry)
+        for k, e in matched_entries:
+            sid = e["result"].get("stream_id")
+            seen_streams.setdefault(sid, []).append((k, e))
+        unique_checks = [(entries[0][0], entries[0][1]) for entries in seen_streams.values()]
 
-        # Progress tracking
-        completed = [0]
-        broken_count = [0]
-        lock = threading.Lock()
+        total = len(unique_checks)
+        if total > 0:
+            print(f"  Validating {total} unique stream URLs (parallel)...")
 
-        def update_progress():
-            with lock:
-                pct = (completed[0] / total) * 100 if total > 0 else 100
-                sys.stdout.write(f"\r  [{completed[0]}/{total}] {pct:.0f}% complete, {broken_count[0]} broken")
-                sys.stdout.flush()
+            def check_entry(movie_key, entry):
+                result = entry["result"]
+                stream_id = result.get("stream_id")
+                url = build_stream_url(result, config)
+                is_valid = check_stream_url(url)
+                return movie_key, entry, stream_id, is_valid
 
-        # Run parallel validation
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = {executor.submit(check_entry, k, e): (k, e) for k, e in matched_entries}
+            completed = [0]
+            broken_count = [0]
+            lock = threading.Lock()
 
-            for future in as_completed(futures):
-                movie_key, entry, stream_id, is_valid = future.result()
-                completed[0] += 1
+            def update_progress():
+                with lock:
+                    pct = (completed[0] / total) * 100
+                    sys.stdout.write(f"\r  [{completed[0]}/{total}] {pct:.0f}% complete, {broken_count[0]} broken")
+                    sys.stdout.flush()
 
-                if not is_valid:
-                    stats["broken"] += 1
-                    stats["matched"] -= 1
-                    entry["state"] = "unavailable"
-                    entry["prev_stream_id"] = stream_id
-                    entry["result"] = None
-                    broken_count[0] += 1
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = {executor.submit(check_entry, k, e): (k, e)
+                          for k, e in unique_checks}
 
-                # Update progress every 10 completions or at the end
-                if completed[0] % 10 == 0 or completed[0] == total:
-                    update_progress()
+                for future in as_completed(futures):
+                    movie_key, entry, stream_id, is_valid = future.result()
+                    completed[0] += 1
 
-        print()  # newline after progress
+                    if not is_valid:
+                        # Mark ALL entries sharing this stream_id as broken
+                        for mk, me in seen_streams.get(stream_id, []):
+                            stats["broken"] += 1
+                            stats["matched"] -= 1
+                            me["state"] = "unavailable"
+                            me["prev_stream_id"] = stream_id
+                            me["result"] = None
+                        broken_count[0] += 1
 
-    # Generate entry blocks
+                    if completed[0] % 10 == 0 or completed[0] == total:
+                        update_progress()
+
+            print()  # newline after progress
+
+    # Render entry blocks
     for movie_key, entry in entries_by_movie_key.items():
         movie = entry["movie"]
-        video = entry["video"]
         state = entry["state"]
         result = entry.get("result")
+        group = entry.get("group", playlist_name)
+        meta_lines = entry.get("meta_lines", [])
 
         movie_name = movie.get("name", "Unknown")
         year_str = f" | year: {movie['year']}" if movie.get("year") else ""
-        video_str = f"{video['id']} | {video['title']}" if video else "unknown"
 
-        # Skip entries with no movie name
         if not movie_name or movie_name == "Unknown":
             continue
 
         lines.append(META_ENTRY_START)
-        lines.append(f"{META_VIDEO} {video_str}")
+        for ml in meta_lines:
+            lines.append(ml)
         lines.append(f"{META_MOVIE} {movie_name}{year_str} | {state}")
 
         if state == "matched" and result:
             stream_id = result.get("stream_id")
-            ext = result.get("container_extension", "mp4")
             icon = result.get("stream_icon", "")
             name = result.get("name", movie_name)
-            group = video["title"] if video else "Movies"
+            url = build_stream_url(result, config)
 
-            url = f"{config['iptv_server']}/movie/{config['iptv_username']}/{config['iptv_password']}/{stream_id}.{ext}"
+            source_name = result.get("_source", {}).get("name", "")
+            if source_name:
+                lines.append(f"{META_SOURCE} {source_name}")
 
             lines.append(f"# stream_id: {stream_id}")
             lines.append(f'#EXTINF:-1 tvg-id="" tvg-name="{name}" tvg-logo="{icon}" group-title="{group}",{name}')
@@ -865,10 +1254,8 @@ def generate_m3u_content(channel_handle, video_data, config, vod_index, existing
         elif state == "unavailable":
             prev_id = entry.get("prev_stream_id", "unknown")
             lines.append(f"# stream_id: {prev_id} (unavailable since {timestamp})")
-            lines.append(f"# #EXTINF:-1 group-title=\"{video['title'] if video else 'Movies'}\",{movie_name}")
+            lines.append(f'# #EXTINF:-1 group-title="{group}",{movie_name}')
             lines.append(f"# (stream unavailable)")
-
-        # unmatched entries just have the metadata, no EXTINF
 
         lines.append(META_ENTRY_END)
         lines.append("")
@@ -920,20 +1307,29 @@ def process_channel(channel_handle, config, vod_index, existing_metadata=None, n
     return video_data
 
 
-def sync_playlists(config, workers=5, upload=False, gdrive_folder=None):
-    """Sync all existing playlists with current catalog."""
+def sync_playlists(configs, workers=5, upload=False, gdrive_folder=None):
+    """Sync all existing playlists with current catalog.
+
+    Args:
+        configs: List of config dicts (or single config dict for backward compat).
+    """
+    # Accept single config for backward compat
+    if isinstance(configs, dict):
+        configs = [configs]
+
+    config = configs[0]  # Primary config for output_dir and fallback
     output_dir = SCRIPT_DIR / config["output_dir"]
     if not output_dir.exists():
         print("No playlists directory found. Run a full build first.")
         return
 
-    # Fetch fresh VOD catalog
-    vod_data = fetch_vod_catalog(config)
+    # Fetch merged VOD catalog from all sources
+    vod_data = fetch_multi_vod_catalog(configs)
     if not vod_data:
         print("Failed to fetch VOD catalog")
         return
     vod_index = build_vod_index(vod_data)
-    print(f"VOD catalog: {len(vod_index)} items")
+    print(f"VOD catalog: {len(vod_index)} unique items from {len(configs)} source(s)")
 
     # Find all M3U files
     m3u_files = list(output_dir.glob("*.m3u"))
@@ -954,8 +1350,28 @@ def sync_playlists(config, workers=5, upload=False, gdrive_folder=None):
         # Check for new videos
         video_data = process_channel(channel_handle, config, vod_index, metadata, new_videos_only=True)
 
+        # Pre-process existing entries and convert new videos to common format
+        existing_entries = preprocess_existing_entries(metadata, vod_index)
+        new_movies = movies_from_video_data(video_data)
+
+        # Compute processed video IDs for header
+        processed_videos = metadata["videos_processed"].copy()
+        for video in video_data:
+            processed_videos.add(video["video_id"])
+
+        header = [
+            f"{META_CHANNEL} {channel_handle}",
+            f"{META_VIDEOS} {','.join(sorted(processed_videos))}",
+            f"# Source: https://www.youtube.com/{channel_handle}",
+        ]
+
         # Generate updated M3U with URL validation
-        m3u_content, stats = generate_m3u_content(channel_handle, video_data, config, vod_index, metadata, validate_urls=True, workers=workers)
+        m3u_content, stats = generate_m3u(
+            channel_handle, new_movies, config, vod_index,
+            existing_entries=existing_entries,
+            validate_urls=True, workers=workers,
+            header_lines=header,
+        )
         m3u_file.write_text(m3u_content)
 
         print(f"  Results:")
@@ -1026,6 +1442,7 @@ Examples:
   python generate_playlist.py --sync               # Sync all playlists
   python generate_playlist.py --playlist xtreme    # Use specific IPTVX playlist
   python generate_playlist.py --playlists          # List IPTVX playlists
+  python generate_playlist.py --from-file movies.csv --name "My Movies"  # From CSV file
         """
     )
     parser.add_argument("--version", "-V", action="version", version="%(prog)s 0.1.0")
@@ -1035,6 +1452,11 @@ Examples:
     parser.add_argument("--sync", action="store_true", help="Sync existing playlists with current catalog")
     parser.add_argument("--workers", type=int, default=5, help="Parallel workers for URL validation (default: 5)")
     parser.add_argument("-o", "--output", help="Output file (for single channel)")
+    parser.add_argument("--from-file", metavar="FILE", help="CSV file with movie titles to search (columns: title, title_en, year)")
+    parser.add_argument("--name", metavar="NAME", help="Playlist name (required with --from-file)")
+    parser.add_argument("--group-by", nargs="+", metavar="COLUMN", help="CSV column(s) to group entries by (e.g. year genre)")
+    parser.add_argument("--type", choices=["movie", "series"], default="movie", help="Content type to search (default: movie)")
+    parser.add_argument("--append", action="store_true", help="Append to existing playlist instead of replacing")
     parser.add_argument("--upload", action="store_true", help="Upload to Google Drive, share publicly, add to IPTVX")
     parser.add_argument("--setup-gdrive", action="store_true", help="Set up Google Drive OAuth authentication")
     parser.add_argument("--gdrive-folder", metavar="ID", help="Google Drive folder ID (default: iptvx-playlists)")
@@ -1054,12 +1476,175 @@ Examples:
             print(f"  Username: {selected['username']}")
         return
 
-    # Load config
-    config = load_config(args.playlist)
+    # Load configs (multi-credential)
+    configs = load_configs(args.playlist)
+    config = configs[0]  # Primary config for output_dir and fallback
 
     # Handle --sync
     if args.sync:
-        sync_playlists(config, workers=args.workers, upload=args.upload, gdrive_folder=args.gdrive_folder)
+        sync_playlists(configs, workers=args.workers, upload=args.upload, gdrive_folder=args.gdrive_folder)
+        return
+
+    # Handle --from-file
+    if args.from_file:
+        if not args.name:
+            print("Error: --name is required with --from-file")
+            sys.exit(1)
+
+        parsed = parse_movie_file(args.from_file)
+        content_type = args.type
+        print(f"Loaded {len(parsed)} titles from {args.from_file} (type: {content_type})")
+
+        output_dir = SCRIPT_DIR / config["output_dir"]
+        output_dir.mkdir(exist_ok=True)
+        output_file = Path(args.output) if args.output else output_dir / f"{sanitize_filename(args.name)}.m3u"
+
+        if content_type == "series":
+            # Fetch series catalog
+            series_data = fetch_multi_series_catalog(configs)
+            if not series_data:
+                sys.exit(1)
+            series_index = build_vod_index(series_data)
+            print(f"Series catalog: {len(series_index)} unique items from {len(configs)} source(s)")
+
+            # Match titles against series catalog, collecting all groups per series
+            movie_entries = movies_from_file(parsed, args.name, group_by=args.group_by)
+            match_cache = {}
+            # series_matches: identity -> {result, groups: [group1, group2, ...]}
+            series_matches = {}
+            for entry in movie_entries:
+                identity = f"{entry['name']}|{entry.get('year', '')}"
+                if identity in match_cache:
+                    result = match_cache[identity]
+                else:
+                    result = None
+                    for title in entry.get("search_titles", [entry["name"]]):
+                        if title:
+                            result = find_movie(title, entry.get("year"), series_index)
+                            if result:
+                                break
+                    match_cache[identity] = result
+                if result:
+                    if identity not in series_matches:
+                        series_matches[identity] = {"result": result, "groups": []}
+                    series_matches[identity]["groups"].append(entry["group"])
+
+            matched_series = list(series_matches.values())
+            print(f"Matched {len(matched_series)} series, fetching episodes...")
+
+            # Fetch episodes for each matched series and build M3U entries
+            series_lines = []
+            total_episodes = 0
+            for i, match in enumerate(matched_series, 1):
+                series = match["result"]
+                groups = match["groups"]
+                source = series.get("_source", {})
+                series_config = {
+                    "iptv_server": source.get("server", config["iptv_server"]),
+                    "iptv_username": source.get("username", config["iptv_username"]),
+                    "iptv_password": source.get("password", config["iptv_password"]),
+                }
+                series_name = series.get("title") or series.get("name", "Unknown")
+                series_id = series.get("series_id")
+                cover = series.get("cover", "")
+
+                sys.stdout.write(f"\r  [{i}/{len(matched_series)}] {series_name[:50]:<50}")
+                sys.stdout.flush()
+
+                episodes = fetch_series_episodes(series_config, series_id)
+                if not episodes:
+                    continue
+
+                # Emit each episode under each group (year, genre, etc.)
+                for group in groups:
+                    for ep in episodes:
+                        ep_name = f"{series_name} S{ep['season']:02d}E{ep['episode_num']:02d}"
+                        if ep.get("title"):
+                            ep_name += f" - {ep['title']}"
+                        url = build_series_stream_url(series, ep["id"], ep.get("container_extension", "mp4"))
+
+                        series_lines.append(META_ENTRY_START)
+                        series_lines.append(f"{META_MOVIE} {series_name} | year: {series.get('year', 'unknown')} | matched")
+                        source_name = source.get("name", "")
+                        if source_name:
+                            series_lines.append(f"{META_SOURCE} {source_name}")
+                        series_lines.append(f'#EXTINF:-1 tvg-id="" tvg-name="{ep_name}" tvg-logo="{cover}" group-title="{group}",{ep_name}')
+                        series_lines.append(url)
+                        series_lines.append(META_ENTRY_END)
+                        series_lines.append("")
+                        total_episodes += 1
+
+            print(f"\n  Found {total_episodes} episodes from {len(matched_series)} series")
+
+            # Append or create
+            if args.append and output_file.exists():
+                existing = output_file.read_text().rstrip("\n")
+                new_content = existing + "\n" + "\n".join(series_lines)
+            else:
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                header = [
+                    "#EXTM3U",
+                    META_HEADER,
+                    f"{META_SYNCED} {timestamp}",
+                    f"# @name: {args.name}",
+                    f"# @source_type: file",
+                    "",
+                ]
+                new_content = "\n".join(header + series_lines)
+
+            output_file.write_text(new_content)
+            print(f"\nResults for '{args.name}' (series):")
+            print(f"  Matched: {len(matched_series)} / {len(parsed)} shows")
+            print(f"  Episodes: {total_episodes}")
+            print(f"  Output: {output_file}")
+
+        else:
+            # Movie flow
+            vod_data = fetch_multi_vod_catalog(configs)
+            if not vod_data:
+                sys.exit(1)
+            vod_index = build_vod_index(vod_data)
+            print(f"VOD catalog: {len(vod_index)} unique items from {len(configs)} source(s)")
+
+            movie_entries = movies_from_file(parsed, args.name, group_by=args.group_by)
+            header = [
+                f"# @name: {args.name}",
+                f"# @source_type: file",
+            ]
+            m3u_content, stats = generate_m3u(
+                args.name, movie_entries, config, vod_index,
+                validate_urls=True, workers=args.workers,
+                header_lines=header,
+            )
+
+            if args.append and output_file.exists():
+                existing = output_file.read_text().rstrip("\n")
+                # Extract just the entry blocks from new content (skip header)
+                new_lines = m3u_content.split("\n")
+                entry_start = next((i for i, l in enumerate(new_lines) if l.strip() == META_ENTRY_START), len(new_lines))
+                new_content = existing + "\n" + "\n".join(new_lines[entry_start:])
+            else:
+                new_content = m3u_content
+
+            output_file.write_text(new_content)
+
+            print(f"\nResults for '{args.name}':")
+            print(f"  Matched: {stats['matched']} / {len(parsed)} movies")
+            print(f"  Unmatched: {stats['unmatched']} movies")
+            if stats["broken"]:
+                print(f"  Broken streams: {stats['broken']}")
+            print(f"  Output: {output_file}")
+
+        if args.upload:
+            result = upload_and_register(output_file, args.name, args.gdrive_folder)
+            if result['uploaded']:
+                print(f"  Uploaded: {result['url']}")
+                if result['iptvx_updated']:
+                    print(f"  Updated in IPTVX: {args.name}")
+                elif result['needs_manual_add']:
+                    print(f"  Add to IPTVX manually: {args.name}")
+            else:
+                print(f"  Upload failed")
         return
 
     # Full rebuild mode - require channel argument
@@ -1069,12 +1654,12 @@ Examples:
 
     channels = [{"handle": ch if ch.startswith("@") else f"@{ch}", "name": ch.lstrip("@")} for ch in args.channels]
 
-    # Fetch VOD catalog
-    vod_data = fetch_vod_catalog(config)
+    # Fetch merged VOD catalog from all sources
+    vod_data = fetch_multi_vod_catalog(configs)
     if not vod_data:
         sys.exit(1)
     vod_index = build_vod_index(vod_data)
-    print(f"VOD catalog: {len(vod_index)} items")
+    print(f"VOD catalog: {len(vod_index)} unique items from {len(configs)} source(s)")
 
     # Create output directory
     output_dir = SCRIPT_DIR / config["output_dir"]
@@ -1085,7 +1670,17 @@ Examples:
         video_data = process_channel(channel["handle"], config, vod_index)
 
         if video_data:
-            m3u_content, stats = generate_m3u_content(channel["handle"], video_data, config, vod_index)
+            movie_entries = movies_from_video_data(video_data)
+            processed_videos = {v["video_id"] for v in video_data}
+            header = [
+                f"{META_CHANNEL} {channel['handle']}",
+                f"{META_VIDEOS} {','.join(sorted(processed_videos))}",
+                f"# Source: https://www.youtube.com/{channel['handle']}",
+            ]
+            m3u_content, stats = generate_m3u(
+                channel["handle"], movie_entries, config, vod_index,
+                header_lines=header,
+            )
 
             if args.output and len(channels) == 1:
                 output_file = Path(args.output)
