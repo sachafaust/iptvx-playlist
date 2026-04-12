@@ -185,7 +185,11 @@ def share_file_public(file_id):
 
     if filename:
         cmd = ['rclone', 'link', f'{RCLONE_REMOTE}:{filename}']
-        subprocess.run(cmd, capture_output=True, text=True)
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f"Warning: Failed to share file publicly: {result.stderr.strip()}")
+    else:
+        print(f"Warning: Could not find file with ID {file_id} for sharing")
 
     return f"https://drive.google.com/uc?export=download&id={file_id}"
 
@@ -567,12 +571,22 @@ def parse_movies_from_description(description):
     return movies
 
 
-def fetch_vod_catalog(config):
-    """Fetch VOD catalog from provider API."""
-    print("Fetching VOD catalog from provider...")
-    url = f"{config['iptv_server']}/player_api.php?username={config['iptv_username']}&password={config['iptv_password']}&action=get_vod_streams"
+def _fetch_catalog(config, action, label):
+    """Fetch a catalog from the Xtream Codes API.
 
-    # Use temp file for large response
+    Args:
+        config: IPTV config dict with server/username/password.
+        action: API action (e.g. 'get_vod_streams', 'get_series').
+        label: Human-readable label for log messages (e.g. 'VOD', 'series').
+
+    Returns:
+        List of catalog items, or empty list on failure.
+    """
+    print(f"Fetching {label} catalog from provider...")
+    url = (f"{config['iptv_server']}/player_api.php?"
+           f"username={config['iptv_username']}&password={config['iptv_password']}"
+           f"&action={action}")
+
     import tempfile
     with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as tmp:
         tmp_path = tmp.name
@@ -582,104 +596,50 @@ def fetch_vod_catalog(config):
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=200)
 
         if result.returncode != 0:
-            print("Error: Failed to fetch VOD catalog from provider.")
-            print(f"  Check your network connection and verify the server is accessible.")
+            print(f"Error: Failed to fetch {label} catalog from provider.")
             return []
 
         with open(tmp_path, 'r') as f:
             data = json.load(f)
 
-        print(f"Loaded {len(data)} VOD items from provider")
+        print(f"Loaded {len(data)} {label} items from provider")
         return data
     except json.JSONDecodeError:
-        print("Error: VOD catalog response is not valid JSON.")
-        print("  The server may be down or credentials may be incorrect.")
+        print(f"Error: {label.capitalize()} catalog response is not valid JSON.")
         return []
     except subprocess.TimeoutExpired:
-        print("Error: VOD catalog fetch timed out after 3 minutes.")
+        print(f"Error: {label.capitalize()} catalog fetch timed out.")
         return []
     except FileNotFoundError:
         print("Error: 'curl' command not found. Please install curl.")
         return []
     except Exception as e:
-        print(f"Error fetching VOD catalog: {e}")
+        print(f"Error fetching {label} catalog: {e}")
         return []
     finally:
-        # Clean up temp file
-        import os
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)
 
 
-def fetch_multi_vod_catalog(configs):
-    """Fetch and merge VOD catalogs from multiple providers.
-
-    Each item is stamped with a _source dict containing the server credentials
-    it came from, so build_stream_url() can construct the correct URL.
-
-    Args:
-        configs: List of config dicts.
-
-    Returns:
-        Merged list of VOD items (first config's items listed first = higher priority).
-    """
-    merged = []
-    for config in configs:
-        name = config.get("_name", config["iptv_server"])
-        data = fetch_vod_catalog(config)
-        for item in data:
-            item["_source"] = {
-                "name": name,
-                "server": config["iptv_server"],
-                "username": config["iptv_username"],
-                "password": config["iptv_password"],
-            }
-        merged.extend(data)
-    return merged
+def fetch_vod_catalog(config):
+    """Fetch VOD catalog from provider API."""
+    return _fetch_catalog(config, "get_vod_streams", "VOD")
 
 
 def fetch_series_catalog(config):
     """Fetch series catalog from provider API."""
-    print("Fetching series catalog from provider...")
-    url = f"{config['iptv_server']}/player_api.php?username={config['iptv_username']}&password={config['iptv_password']}&action=get_series"
-
-    import tempfile
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as tmp:
-        tmp_path = tmp.name
-
-    try:
-        cmd = ['curl', '-s', '--max-time', '180', '-o', tmp_path, url]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=200)
-
-        if result.returncode != 0:
-            print("Error: Failed to fetch series catalog from provider.")
-            return []
-
-        with open(tmp_path, 'r') as f:
-            data = json.load(f)
-
-        print(f"Loaded {len(data)} series from provider")
-        return data
-    except json.JSONDecodeError:
-        print("Error: Series catalog response is not valid JSON.")
-        return []
-    except subprocess.TimeoutExpired:
-        print("Error: Series catalog fetch timed out.")
-        return []
-    except Exception as e:
-        print(f"Error fetching series catalog: {e}")
-        return []
-    finally:
-        if os.path.exists(tmp_path):
-            os.unlink(tmp_path)
+    return _fetch_catalog(config, "get_series", "series")
 
 
-def fetch_multi_series_catalog(configs):
-    """Fetch and merge series catalogs from multiple providers."""
+def _fetch_multi_catalog(configs, fetch_fn):
+    """Fetch and merge catalogs from multiple providers.
+
+    Each item is stamped with a _source dict so stream URLs use the correct credentials.
+    """
     merged = []
     for config in configs:
         name = config.get("_name", config["iptv_server"])
-        data = fetch_series_catalog(config)
+        data = fetch_fn(config)
         for item in data:
             item["_source"] = {
                 "name": name,
@@ -689,6 +649,16 @@ def fetch_multi_series_catalog(configs):
             }
         merged.extend(data)
     return merged
+
+
+def fetch_multi_vod_catalog(configs):
+    """Fetch and merge VOD catalogs from multiple providers."""
+    return _fetch_multi_catalog(configs, fetch_vod_catalog)
+
+
+def fetch_multi_series_catalog(configs):
+    """Fetch and merge series catalogs from multiple providers."""
+    return _fetch_multi_catalog(configs, fetch_series_catalog)
 
 
 def fetch_series_episodes(config, series_id):
@@ -700,7 +670,7 @@ def fetch_series_episodes(config, series_id):
 
     Returns:
         List of episode dicts with 'id', 'title', 'season', 'episode_num',
-        'container_extension', 'info' keys.
+        'container_extension' keys.
     """
     url = (f"{config['iptv_server']}/player_api.php?"
            f"username={config['iptv_username']}&password={config['iptv_password']}"
@@ -1205,9 +1175,11 @@ def generate_m3u(playlist_name, movies, config, vod_index,
 
                     if not is_valid:
                         # Mark ALL entries sharing this stream_id as broken
-                        for mk, me in seen_streams.get(stream_id, []):
-                            stats["broken"] += 1
-                            stats["matched"] -= 1
+                        # but only count once per unique stream in stats
+                        entries_for_stream = seen_streams.get(stream_id, [])
+                        stats["broken"] += 1
+                        stats["matched"] -= len(entries_for_stream)
+                        for mk, me in entries_for_stream:
                             me["state"] = "unavailable"
                             me["prev_stream_id"] = stream_id
                             me["result"] = None
@@ -1432,6 +1404,102 @@ def list_iptvx_playlists():
             return None
 
 
+def generate_series_m3u(playlist_name, movie_entries, series_index, config, workers=5):
+    """Generate M3U lines for series content.
+
+    Matches titles against series catalog, fetches episodes in parallel,
+    and returns M3U entry lines with stats.
+
+    Args:
+        playlist_name: Playlist name for metadata.
+        movie_entries: Common-format entries from movies_from_file().
+        series_index: Pre-built series search index.
+        config: Primary IPTV config for fallback credentials.
+        workers: Parallel workers for episode fetching.
+
+    Returns:
+        Tuple of (lines_list, matched_count, total_episodes, total_input).
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    # Match titles, collecting all groups per series
+    match_cache = {}
+    series_matches = {}
+    for entry in movie_entries:
+        identity = f"{entry['name']}|{entry.get('year', '')}"
+        if identity in match_cache:
+            result = match_cache[identity]
+        else:
+            result = None
+            for title in entry.get("search_titles", [entry["name"]]):
+                if title:
+                    result = find_movie(title, entry.get("year"), series_index)
+                    if result:
+                        break
+            match_cache[identity] = result
+        if result:
+            if identity not in series_matches:
+                series_matches[identity] = {"result": result, "groups": []}
+            series_matches[identity]["groups"].append(entry["group"])
+
+    matched_series = list(series_matches.values())
+    print(f"Matched {len(matched_series)} series, fetching episodes...")
+
+    # Fetch episodes in parallel
+    def _fetch_eps(match):
+        series = match["result"]
+        source = series.get("_source", {})
+        series_config = {
+            "iptv_server": source.get("server", config["iptv_server"]),
+            "iptv_username": source.get("username", config["iptv_username"]),
+            "iptv_password": source.get("password", config["iptv_password"]),
+        }
+        series_id = series.get("series_id")
+        return match, fetch_series_episodes(series_config, series_id)
+
+    episode_results = []
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(_fetch_eps, m): m for m in matched_series}
+        for i, future in enumerate(as_completed(futures), 1):
+            match, episodes = future.result()
+            series_name = match["result"].get("title") or match["result"].get("name", "Unknown")
+            sys.stdout.write(f"\r  [{i}/{len(matched_series)}] {series_name[:50]:<50}")
+            sys.stdout.flush()
+            if episodes:
+                episode_results.append((match, episodes))
+
+    # Render M3U entry lines
+    lines = []
+    total_episodes = 0
+    for match, episodes in episode_results:
+        series = match["result"]
+        groups = match["groups"]
+        source = series.get("_source", {})
+        series_name = series.get("title") or series.get("name", "Unknown")
+        cover = series.get("cover", "")
+
+        for group in groups:
+            for ep in episodes:
+                ep_name = f"{series_name} S{ep['season']:02d}E{ep['episode_num']:02d}"
+                if ep.get("title"):
+                    ep_name += f" - {ep['title']}"
+                url = build_series_stream_url(series, ep["id"], ep.get("container_extension", "mp4"))
+
+                lines.append(META_ENTRY_START)
+                lines.append(f"{META_MOVIE} {series_name} | year: {series.get('year', 'unknown')} | matched")
+                source_name = source.get("name", "")
+                if source_name:
+                    lines.append(f"{META_SOURCE} {source_name}")
+                lines.append(f'#EXTINF:-1 tvg-id="" tvg-name="{ep_name}" tvg-logo="{cover}" group-title="{group}",{ep_name}')
+                lines.append(url)
+                lines.append(META_ENTRY_END)
+                lines.append("")
+                total_episodes += 1
+
+    print(f"\n  Found {total_episodes} episodes from {len(matched_series)} series")
+    return lines, len(matched_series), total_episodes
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Generate M3U playlists from YouTube movie recommendation channels",
@@ -1507,74 +1575,10 @@ Examples:
             series_index = build_vod_index(series_data)
             print(f"Series catalog: {len(series_index)} unique items from {len(configs)} source(s)")
 
-            # Match titles against series catalog, collecting all groups per series
             movie_entries = movies_from_file(parsed, args.name, group_by=args.group_by)
-            match_cache = {}
-            # series_matches: identity -> {result, groups: [group1, group2, ...]}
-            series_matches = {}
-            for entry in movie_entries:
-                identity = f"{entry['name']}|{entry.get('year', '')}"
-                if identity in match_cache:
-                    result = match_cache[identity]
-                else:
-                    result = None
-                    for title in entry.get("search_titles", [entry["name"]]):
-                        if title:
-                            result = find_movie(title, entry.get("year"), series_index)
-                            if result:
-                                break
-                    match_cache[identity] = result
-                if result:
-                    if identity not in series_matches:
-                        series_matches[identity] = {"result": result, "groups": []}
-                    series_matches[identity]["groups"].append(entry["group"])
-
-            matched_series = list(series_matches.values())
-            print(f"Matched {len(matched_series)} series, fetching episodes...")
-
-            # Fetch episodes for each matched series and build M3U entries
-            series_lines = []
-            total_episodes = 0
-            for i, match in enumerate(matched_series, 1):
-                series = match["result"]
-                groups = match["groups"]
-                source = series.get("_source", {})
-                series_config = {
-                    "iptv_server": source.get("server", config["iptv_server"]),
-                    "iptv_username": source.get("username", config["iptv_username"]),
-                    "iptv_password": source.get("password", config["iptv_password"]),
-                }
-                series_name = series.get("title") or series.get("name", "Unknown")
-                series_id = series.get("series_id")
-                cover = series.get("cover", "")
-
-                sys.stdout.write(f"\r  [{i}/{len(matched_series)}] {series_name[:50]:<50}")
-                sys.stdout.flush()
-
-                episodes = fetch_series_episodes(series_config, series_id)
-                if not episodes:
-                    continue
-
-                # Emit each episode under each group (year, genre, etc.)
-                for group in groups:
-                    for ep in episodes:
-                        ep_name = f"{series_name} S{ep['season']:02d}E{ep['episode_num']:02d}"
-                        if ep.get("title"):
-                            ep_name += f" - {ep['title']}"
-                        url = build_series_stream_url(series, ep["id"], ep.get("container_extension", "mp4"))
-
-                        series_lines.append(META_ENTRY_START)
-                        series_lines.append(f"{META_MOVIE} {series_name} | year: {series.get('year', 'unknown')} | matched")
-                        source_name = source.get("name", "")
-                        if source_name:
-                            series_lines.append(f"{META_SOURCE} {source_name}")
-                        series_lines.append(f'#EXTINF:-1 tvg-id="" tvg-name="{ep_name}" tvg-logo="{cover}" group-title="{group}",{ep_name}')
-                        series_lines.append(url)
-                        series_lines.append(META_ENTRY_END)
-                        series_lines.append("")
-                        total_episodes += 1
-
-            print(f"\n  Found {total_episodes} episodes from {len(matched_series)} series")
+            series_lines, matched_count, total_episodes = generate_series_m3u(
+                args.name, movie_entries, series_index, config, workers=args.workers,
+            )
 
             # Append or create
             if args.append and output_file.exists():
@@ -1594,7 +1598,7 @@ Examples:
 
             output_file.write_text(new_content)
             print(f"\nResults for '{args.name}' (series):")
-            print(f"  Matched: {len(matched_series)} / {len(parsed)} shows")
+            print(f"  Matched: {matched_count} / {len(parsed)} shows")
             print(f"  Episodes: {total_episodes}")
             print(f"  Output: {output_file}")
 
