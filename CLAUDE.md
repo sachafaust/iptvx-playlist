@@ -57,7 +57,11 @@ No config file needed. Credentials are never stored in project files.
 | `parse_movies_from_description()` | Extract movie titles from timestamp lines |
 | `fetch_vod_catalog()` | Get VOD catalog from Xtream API |
 | `find_movie()` | Match movie title against VOD index |
-| `generate_m3u_content()` | Build M3U with metadata tracking |
+| `generate_m3u()` | Unified M3U pipeline: match, validate, render |
+| `movies_from_video_data()` | Convert YouTube data to common entry format |
+| `movies_from_file()` | Convert CSV data to common entry format |
+| `preprocess_existing_entries()` | Re-match existing M3U entries for sync |
+| `parse_movie_file()` | Parse CSV file with movie titles |
 | `sync_playlists()` | Incremental update with URL validation |
 | `upload_to_gdrive()` | Upload M3U file to Google Drive |
 | `share_file_public()` | Share file with "anyone with link" |
