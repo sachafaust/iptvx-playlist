@@ -43,7 +43,7 @@ python generate_playlist.py --setup-gdrive
 
 ## Credential Sources (priority order)
 
-1. **IPTVX App** - Auto-reads from `~/Library/Containers/.../IPTVX/CloudKit.sqlite`
+1. **IPTVX App** - Auto-reads from `~/Library/Containers/com.mgapps.iptvx/Data/Library/Application Support/IPTVX/CloudKit.sqlite`
 2. **Environment variables** - `IPTV_SERVER`, `IPTV_USERNAME`, `IPTV_PASSWORD`
 
 No config file needed. Credentials are never stored in project files.
@@ -92,7 +92,7 @@ States: `matched`, `unmatched`, `unavailable`
 ### Data Locations
 
 ```
-~/Library/Containers/27DB3F00-3088-4A00-BCCF-C8F6CB49A29F/Data/
+~/Library/Containers/com.mgapps.iptvx/Data/
 ├── Documents/realm-db.realm           # Content database
 └── Library/Application Support/IPTVX/
     └── CloudKit.sqlite                # Playlist configs (credentials here)

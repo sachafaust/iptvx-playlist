@@ -26,8 +26,8 @@ from datetime import datetime
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).parent
-IPTVX_REALM_PATH = Path.home() / "Library/Containers/27DB3F00-3088-4A00-BCCF-C8F6CB49A29F/Data/Documents/realm-db.realm"
-IPTVX_SQLITE_PATH = Path.home() / "Library/Containers/27DB3F00-3088-4A00-BCCF-C8F6CB49A29F/Data/Library/Application Support/IPTVX/CloudKit.sqlite"
+IPTVX_REALM_PATH = Path.home() / "Library/Containers/com.mgapps.iptvx/Data/Documents/realm-db.realm"
+IPTVX_SQLITE_PATH = Path.home() / "Library/Containers/com.mgapps.iptvx/Data/Library/Application Support/IPTVX/CloudKit.sqlite"
 
 # Google Drive configuration (rclone remote name and default folder)
 GDRIVE_FOLDER_ID = '10i-MdLuzIZCWzRtW5AjBlWJSi7f8JXl3'
