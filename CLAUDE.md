@@ -39,12 +39,24 @@ python generate_playlist.py --sync --workers 10
 
 # Set up Google Drive authentication (one-time)
 python generate_playlist.py --setup-gdrive
+
+# Generate playlist from CSV file
+python generate_playlist.py --from-file movies.csv --name "My Movies"
+
+# Group by year and genre (creates sidebar categories in IPTVX)
+python generate_playlist.py --from-file movies.csv --name "My Movies" --group-by year genre
+
+# Search series catalog instead of movies
+python generate_playlist.py --from-file shows.csv --name "My Shows" --type series
+
+# Append to existing playlist (e.g. add shows to a movie playlist)
+python generate_playlist.py --from-file shows.csv --name "My Playlist" --type series --append
 ```
 
 ## Credential Sources (priority order)
 
-1. **IPTVX App** - Auto-reads from `~/Library/Containers/com.mgapps.iptvx/Data/Library/Application Support/IPTVX/CloudKit.sqlite`
-2. **Environment variables** - `IPTV_SERVER`, `IPTV_USERNAME`, `IPTV_PASSWORD`
+1. **Environment variables** - `IPTV_SERVER`, `IPTV_USERNAME`, `IPTV_PASSWORD`
+2. **IPTVX App** - Auto-reads from `~/Library/Containers/com.mgapps.iptvx/Data/Library/Application Support/IPTVX/CloudKit.sqlite`
 
 No config file needed. Credentials are never stored in project files.
 
@@ -66,6 +78,9 @@ No config file needed. Credentials are never stored in project files.
 | `upload_to_gdrive()` | Upload M3U file to Google Drive |
 | `share_file_public()` | Share file with "anyone with link" |
 | `add_playlist_to_iptvx()` | Add/update M3U playlist in IPTVX database |
+| `fetch_series_catalog()` | Get series catalog from Xtream API |
+| `fetch_series_episodes()` | Get episode list for a series |
+| `generate_series_m3u()` | Match series, fetch episodes, render M3U lines |
 
 ## M3U Metadata Format
 
@@ -141,6 +156,13 @@ Stream URL pattern:
 API endpoints:
 - `GET /player_api.php?username=X&password=Y&action=get_vod_streams`
 - `GET /player_api.php?username=X&password=Y&action=get_vod_categories`
+- `GET /player_api.php?username=X&password=Y&action=get_series`
+- `GET /player_api.php?username=X&password=Y&action=get_series_info&series_id=Z`
+
+Series URL pattern:
+```
+{server}/series/{username}/{password}/{episode_id}.{ext}
+```
 
 ## Development
 
