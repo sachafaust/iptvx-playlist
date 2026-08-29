@@ -131,18 +131,6 @@ python3 generate_playlist.py --sync --upload
 
 Files are uploaded to the configured Google Drive folder and shared with "anyone with link" permission. The URL is automatically added to IPTVX.
 
-## hide_broken.js
-
-Node.js tool to hide broken streams in IPTVX's Realm database:
-
-```bash
-npm install                          # Install realm dependency
-node hide_broken.js --list           # Show Realm schema
-node hide_broken.js --hide 123,456   # Hide specific stream IDs
-node hide_broken.js --from-m3u       # Hide unavailable from playlist
-node hide_broken.js --dry-run        # Preview without changes
-```
-
 ## Xtream Codes API
 
 Stream URL pattern:
@@ -174,7 +162,6 @@ pytest tests/test_generate_playlist.py::TestFindMovie -v
 - **Python 3.9+** (stdlib only, no pip packages for main tool)
 - **yt-dlp** - YouTube scraping (`brew install yt-dlp`)
 - **curl** - API requests (pre-installed on macOS)
-- **Node.js + realm** - Only for hide_broken.js
 
 ### Optional: Google Drive Upload
 
